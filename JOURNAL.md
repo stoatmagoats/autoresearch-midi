@@ -157,6 +157,8 @@
 
 8. **Keep ROCm torch pinned in pyproject.toml.** Direct URL sources in `[tool.uv.sources]` prevent `uv run`/`uv sync` from overwriting ROCm PyTorch with the CUDA version.
 
+9. **Smart repetition control produces richer output.** With motif-aware penalties (scale=0.3 normally, 3.0 during loops), Chopin pieces generate ~3.3× more tokens per piece (1935 vs 576 tokens for 32 bars) compared to aggressive flat penalties. The model fills bars with richer note content when not suppressed by heavy penalties. No degenerate loops detected (streak stays at 0).
+
 ---
 
 ## Next Steps
@@ -168,5 +170,6 @@ See **EXPERIMENTS.md** for the full phased experiment plan (9 experiments across
 - [x] Experiment 1.2: Transposition augmentation — 10× more data via pitch shifting
 - [x] Run 010: Extended training on augmented data (4hr, resumed from Run 008, val_bpb=0.849)
 - [x] KV-cache generation — ~150 tok/s with live progress output
-- [ ] Experiment 1.3: Smarter repetition control — motif-aware penalties in generate.py
+- [x] Experiment 1.3: Smarter repetition control — motif-aware penalties (smart/aggressive/off modes)
 - [ ] Experiment 2.1: Chord tokens (REMI+) for explicit harmony
+- [ ] Experiment 2.2: Longer context window (4096+)

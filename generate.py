@@ -203,29 +203,146 @@ def load_model(checkpoint_path, device="cuda"):
           f"vocab={config.vocab_size}, val_bpb={vbpb:.4f}, step={ckpt.get('step','?')}")
     return model
 
+# ---------------------------------------------------------------------------
+# Motif-Aware Repetition Control (Experiment 1.3)
+# ---------------------------------------------------------------------------
+
+from collections import defaultdict
+from prepare import is_pitch, is_dur, is_vel, dec_pitch
+
+class MotifAwareRepetitionControl:
+    """Hierarchical repetition controller that allows musical motif return
+    while preventing degenerate loops.
+
+    Key concepts:
+    - Bar fingerprint: hash of pitch classes in a bar (ignoring velocity/timing)
+    - Consecutive streak: count of identical adjacent bars (the degenerate case)
+    - Motif return: a bar similar to one heard 2-8 bars ago (the musical case)
+    - Penalty scale: multiplier on all penalties — low normally, high during loops
+
+    When consecutive_streak < 2:   penalty_scale = 0.3  (allow natural repetition)
+    When consecutive_streak == 2:  penalty_scale = 2.0  (getting suspicious)
+    When consecutive_streak >= 3:  penalty_scale = 3.0  (stuck in a loop)
+    """
+
+    def __init__(self, motif_return_bonus=0.4, motif_return_window=(2, 8)):
+        self.bar_tokens = []          # tokens in the current (incomplete) bar
+        self.bar_fingerprints = []    # list of pitch-class tuples, one per completed bar
+        self.bar_pitch_sets = []      # list of sets of MIDI pitches per completed bar
+        self.consecutive_streak = 0
+        self.motif_return_bonus = motif_return_bonus
+        self.motif_min, self.motif_max = motif_return_window
+        # Track which pitch fingerprints appeared at which bar indices
+        self.fingerprint_to_bars = defaultdict(list)  # fingerprint -> [bar_idx, ...]
+
+    def on_token(self, tok_val):
+        """Call after each generated token to update internal state."""
+        if tok_val == BAR:
+            self._complete_bar()
+            self.bar_tokens = []
+        else:
+            self.bar_tokens.append(tok_val)
+
+    def _complete_bar(self):
+        """Called when a BAR token is generated — finalize the previous bar."""
+        if not self.bar_tokens:
+            return
+
+        # Extract pitch classes from the bar (ignoring position, duration, velocity)
+        pitches = tuple(sorted(
+            dec_pitch(t) % 12 for t in self.bar_tokens if is_pitch(t)
+        ))
+        midi_pitches = set(
+            dec_pitch(t) for t in self.bar_tokens if is_pitch(t)
+        )
+
+        bar_idx = len(self.bar_fingerprints)
+        self.bar_fingerprints.append(pitches)
+        self.bar_pitch_sets.append(midi_pitches)
+        self.fingerprint_to_bars[pitches].append(bar_idx)
+
+        # Track consecutive identical bars
+        if bar_idx > 0 and self.bar_fingerprints[bar_idx - 1] == pitches:
+            self.consecutive_streak += 1
+        else:
+            self.consecutive_streak = 0
+
+    def get_penalty_scale(self):
+        """Returns a multiplier for all anti-repetition penalties.
+        < 1.0 = relaxed (allow repetition), > 1.0 = tightened (prevent loops).
+        """
+        if self.consecutive_streak >= 3:
+            return 3.0    # strongly penalize — stuck in a loop
+        elif self.consecutive_streak >= 2:
+            return 2.0    # getting suspicious — escalate
+        else:
+            return 0.3    # allow natural musical repetition
+
+    def get_motif_return_bonus_pitches(self):
+        """Returns a set of MIDI pitch token IDs that should get a small logit
+        boost because they belong to a bar heard 2-8 bars ago (motif return).
+
+        Only activates when not in a loop (consecutive_streak < 2).
+        Returns dict: {pitch_token_id: bonus_amount}
+        """
+        if self.consecutive_streak >= 2:
+            return {}  # don't boost during loops
+
+        n_bars = len(self.bar_fingerprints)
+        if n_bars < self.motif_min:
+            return {}
+
+        # Collect pitches from bars that appeared motif_min..motif_max bars ago
+        bonus_pitches = {}
+        lo = max(0, n_bars - self.motif_max)
+        hi = max(0, n_bars - self.motif_min + 1)
+
+        for bar_idx in range(lo, hi):
+            for midi_pitch in self.bar_pitch_sets[bar_idx]:
+                from prepare import tok_pitch
+                tok_id = tok_pitch(midi_pitch)
+                # Slightly boost — the bonus decreases with distance
+                distance = n_bars - bar_idx
+                amt = self.motif_return_bonus * (1.0 - (distance - self.motif_min) /
+                       max(1, self.motif_max - self.motif_min))
+                bonus_pitches[tok_id] = max(bonus_pitches.get(tok_id, 0), amt)
+
+        return bonus_pitches
+
+    def get_loop_temperature_multiplier(self):
+        """Extra temperature multiplier when stuck in a loop."""
+        if self.consecutive_streak >= 2:
+            return 1.0 + 0.3 * self.consecutive_streak
+        return 1.0
+
+    def should_penalize_bar_token(self):
+        """Returns a penalty to apply to the BAR token when in a loop."""
+        if self.consecutive_streak >= 2:
+            return 2.0 * self.consecutive_streak
+        return 0.0
+
+
 @torch.no_grad()
 def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
              temperature=0.95, top_k=50, top_p=0.95,
              repetition_penalty=1.2, presence_penalty=0.3,
              ngram_penalty=2.0, ngram_sizes=(3, 4, 5, 6, 8),
+             repetition_mode="smart", motif_return_bonus=0.4,
              device="cuda"):
-    """Generate tokens with anti-repetition measures.
-    
-    Anti-repetition strategy:
-    1. repetition_penalty: Scale down logits for any token already in the sequence
-       (standard repetition penalty, multiplicative on logits)
-    2. presence_penalty: Flat additive penalty for tokens seen in last 256 tokens
-    3. ngram_penalty: Penalize tokens that would complete a previously-seen n-gram
-    4. bar-level detection: If last bar duplicates a recent bar, boost diversity
+    """Generate tokens with motif-aware anti-repetition.
+
+    repetition_mode:
+        'smart'      — Motif-aware: low penalties normally, high during loops,
+                       with motif return bonus (NEW DEFAULT)
+        'aggressive' — Original flat penalties (old behavior)
+        'off'        — No anti-repetition penalties at all
     """
     seq = torch.tensor(prompt_tokens, dtype=torch.long, device=device).unsqueeze(0)
     generated = list(prompt_tokens)  # CPU list for fast n-gram tracking
     bar_count = 0
 
-    # N-gram tracking: count how many times each n-gram has appeared
-    from collections import defaultdict
-    ngram_counts = defaultdict(int)  # tuple -> count
-    # Index: prefix -> {last_token: count} for fast lookup
+    # N-gram tracking (used in both smart and aggressive modes)
+    ngram_counts = defaultdict(int)
     ngram_by_prefix = defaultdict(lambda: defaultdict(int))
 
     def _update_ngram_counts(tokens, new_idx):
@@ -237,46 +354,23 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
                 prefix = gram[:-1]
                 ngram_by_prefix[(n, prefix)][gram[-1]] += 1
 
-    def _get_bars(tokens):
-        """Split token sequence into bars (list of tuples)."""
-        bars = []
-        current_bar = []
-        for t in tokens:
-            if t == BAR:
-                if current_bar:
-                    bars.append(tuple(current_bar))
-                current_bar = []
-            else:
-                current_bar.append(t)
-        if current_bar:
-            bars.append(tuple(current_bar))
-        return bars
-
-    def _bar_repetition_streak(bars):
-        """Count how many of the last N bars are identical to the most recent bar."""
-        if len(bars) < 2:
-            return 0
-        last = bars[-1]
-        streak = 0
-        for b in reversed(bars[:-1]):
-            if b == last:
-                streak += 1
-            else:
-                break
-        return streak
-
-    # Structural tokens that must be allowed to repeat freely
-    from prepare import is_pitch, is_dur, is_vel
     def _is_content_token(tok_id):
-        """True for pitch/duration/velocity tokens — the ones we penalize for repetition."""
+        """True for pitch/duration/velocity tokens — the ones we penalize."""
         return is_pitch(tok_id) or is_dur(tok_id) or is_vel(tok_id)
 
     # Initialize n-gram counts from prompt
     for i in range(len(generated)):
         _update_ngram_counts(generated, i)
 
+    # Initialize motif controller (used in 'smart' mode)
+    motif_ctrl = MotifAwareRepetitionControl(
+        motif_return_bonus=motif_return_bonus,
+    )
+    # Feed prompt tokens into motif controller
+    for t in prompt_tokens:
+        motif_ctrl.on_token(t)
+
     kv_caches = None
-    # Prefill: process the entire prompt at once
     ctx = seq
     logits, kv_caches = model(ctx, kv_caches=kv_caches, start_pos=0)
     logits = logits[:, -1, :].float()
@@ -290,50 +384,111 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
         if step > 0 and (step % 50 == 0 or now - last_report >= 2.0):
             elapsed = now - t0
             tok_s = step / elapsed if elapsed > 0 else 0
-            print(f"\r    {step} tokens | {bar_count} bars | {elapsed:.1f}s | {tok_s:.1f} tok/s", end="", flush=True)
+            streak_str = f" streak={motif_ctrl.consecutive_streak}" if repetition_mode == "smart" else ""
+            print(f"\r    {step} tokens | {bar_count} bars | {elapsed:.1f}s | {tok_s:.1f} tok/s{streak_str}", end="", flush=True)
             last_report = now
 
-        # --- Anti-repetition 1: Standard repetition penalty ---
-        if repetition_penalty != 1.0:
-            seen_tokens = set(generated)
-            for tok_id in seen_tokens:
-                if tok_id < logits.size(-1) and _is_content_token(tok_id):
-                    if logits[0, tok_id] > 0:
-                        logits[0, tok_id] /= repetition_penalty
-                    else:
-                        logits[0, tok_id] *= repetition_penalty
+        effective_temp = temperature
 
-        # --- Anti-repetition 2: Presence penalty (recent tokens) ---
-        if presence_penalty > 0:
-            recent_window = generated[-256:] if len(generated) > 256 else generated
-            recent_set = set(recent_window)
-            for tok_id in recent_set:
-                if tok_id < logits.size(-1) and _is_content_token(tok_id):
-                    logits[0, tok_id] -= presence_penalty
+        if repetition_mode == "smart":
+            # --- SMART MODE: motif-aware penalties ---
+            scale = motif_ctrl.get_penalty_scale()
 
-        # --- Anti-repetition 3: N-gram penalty ---
-        if ngram_penalty > 0:
-            for n in ngram_sizes:
-                if len(generated) >= n - 1:
-                    prefix = tuple(generated[-(n - 1):])
-                    token_counts = ngram_by_prefix.get((n, prefix))
-                    if token_counts:
-                        for tok_id, count in token_counts.items():
-                            if tok_id < logits.size(-1):
-                                # Escalating penalty: stronger for more repetitions and longer n-grams
-                                penalty = ngram_penalty * count * (n / 4.0)
-                                logits[0, tok_id] -= penalty
+            # Scaled repetition penalty (gentle normally, strong during loops)
+            if repetition_penalty != 1.0:
+                # Effective penalty: lerp between 1.0 (no penalty) and full penalty
+                eff_rep = 1.0 + (repetition_penalty - 1.0) * scale
+                seen_tokens = set(generated[-512:] if len(generated) > 512 else generated)
+                for tok_id in seen_tokens:
+                    if tok_id < logits.size(-1) and _is_content_token(tok_id):
+                        if logits[0, tok_id] > 0:
+                            logits[0, tok_id] /= eff_rep
+                        else:
+                            logits[0, tok_id] *= eff_rep
 
-        # --- Anti-repetition 4: Bar-level repetition detection ---
-        bars = _get_bars(generated)
-        streak = _bar_repetition_streak(bars)
-        if streak >= 2:
-            # Bars are repeating — boost temperature to break the loop
-            effective_temp = temperature * (1.0 + 0.3 * streak)
-            # Also strongly penalize BAR token to discourage starting yet another copy
-            logits[0, BAR] -= 2.0 * streak
-        else:
-            effective_temp = temperature
+            # Scaled presence penalty
+            if presence_penalty > 0:
+                eff_pres = presence_penalty * scale
+                recent_window = generated[-256:] if len(generated) > 256 else generated
+                recent_set = set(recent_window)
+                for tok_id in recent_set:
+                    if tok_id < logits.size(-1) and _is_content_token(tok_id):
+                        logits[0, tok_id] -= eff_pres
+
+            # Scaled n-gram penalty
+            if ngram_penalty > 0:
+                eff_ngram = ngram_penalty * scale
+                for n in ngram_sizes:
+                    if len(generated) >= n - 1:
+                        prefix = tuple(generated[-(n - 1):])
+                        token_counts = ngram_by_prefix.get((n, prefix))
+                        if token_counts:
+                            for tok_id, count in token_counts.items():
+                                if tok_id < logits.size(-1):
+                                    penalty = eff_ngram * count * (n / 4.0)
+                                    logits[0, tok_id] -= penalty
+
+            # Motif return bonus: boost pitches from bars heard 2-8 bars ago
+            bonus_pitches = motif_ctrl.get_motif_return_bonus_pitches()
+            for tok_id, bonus in bonus_pitches.items():
+                if tok_id < logits.size(-1):
+                    logits[0, tok_id] += bonus
+
+            # Loop-breaking: temperature boost + BAR penalty
+            effective_temp *= motif_ctrl.get_loop_temperature_multiplier()
+            bar_penalty = motif_ctrl.should_penalize_bar_token()
+            if bar_penalty > 0:
+                logits[0, BAR] -= bar_penalty
+
+        elif repetition_mode == "aggressive":
+            # --- AGGRESSIVE MODE: original flat penalties (old behavior) ---
+            if repetition_penalty != 1.0:
+                seen_tokens = set(generated)
+                for tok_id in seen_tokens:
+                    if tok_id < logits.size(-1) and _is_content_token(tok_id):
+                        if logits[0, tok_id] > 0:
+                            logits[0, tok_id] /= repetition_penalty
+                        else:
+                            logits[0, tok_id] *= repetition_penalty
+
+            if presence_penalty > 0:
+                recent_window = generated[-256:] if len(generated) > 256 else generated
+                recent_set = set(recent_window)
+                for tok_id in recent_set:
+                    if tok_id < logits.size(-1) and _is_content_token(tok_id):
+                        logits[0, tok_id] -= presence_penalty
+
+            if ngram_penalty > 0:
+                for n in ngram_sizes:
+                    if len(generated) >= n - 1:
+                        prefix = tuple(generated[-(n - 1):])
+                        token_counts = ngram_by_prefix.get((n, prefix))
+                        if token_counts:
+                            for tok_id, count in token_counts.items():
+                                if tok_id < logits.size(-1):
+                                    penalty = ngram_penalty * count * (n / 4.0)
+                                    logits[0, tok_id] -= penalty
+
+            # Bar-level streak detection (old behavior)
+            def _get_bars_from(tokens):
+                bars, current = [], []
+                for t in tokens:
+                    if t == BAR:
+                        if current: bars.append(tuple(current))
+                        current = []
+                    else: current.append(t)
+                if current: bars.append(tuple(current))
+                return bars
+
+            bars = _get_bars_from(generated)
+            if len(bars) >= 2:
+                last = bars[-1]
+                streak = sum(1 for b in reversed(bars[:-1]) if b == last)
+                if streak >= 2:
+                    effective_temp = temperature * (1.0 + 0.3 * streak)
+                    logits[0, BAR] -= 2.0 * streak
+
+        # 'off' mode: no penalties applied
 
         # Apply temperature
         logits = logits / effective_temp
@@ -358,6 +513,8 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
         # Update tracking
         generated.append(tok_val)
         _update_ngram_counts(generated, len(generated) - 1)
+        if repetition_mode == "smart":
+            motif_ctrl.on_token(tok_val)
         seq = torch.cat([seq, next_tok], dim=1)
 
         # Incremental forward pass: only process the new token with KV-cache
@@ -379,7 +536,8 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
     elapsed = time.perf_counter() - t0
     n_generated = len(generated) - len(prompt_tokens)
     tok_per_sec = n_generated / elapsed if elapsed > 0 else 0
-    print(f"\r    Generated {n_generated} tokens in {elapsed:.1f}s ({tok_per_sec:.1f} tok/s)          ")
+    mode_str = f" [{repetition_mode}]" if repetition_mode != "smart" else ""
+    print(f"\r    Generated {n_generated} tokens in {elapsed:.1f}s ({tok_per_sec:.1f} tok/s){mode_str}          ")
     return seq.squeeze(0).tolist()
 
 
@@ -407,6 +565,12 @@ def main():
                         help="Additive penalty for recently seen tokens (0=off, default: 0.3)")
     parser.add_argument("--ngram-penalty", type=float, default=2.0,
                         help="Penalty for repeating n-grams (0=off, default: 2.0)")
+    parser.add_argument("--repetition-mode", type=str, default="smart",
+                        choices=["smart", "aggressive", "off"],
+                        help="Repetition control mode: smart (motif-aware, default), "
+                             "aggressive (old flat penalties), off (no penalties)")
+    parser.add_argument("--motif-bonus", type=float, default=0.4,
+                        help="Logit bonus for pitches from bars heard 2-8 bars ago (default: 0.4)")
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--n", type=int, default=1)
     parser.add_argument("--seed", type=int, default=None)
@@ -477,6 +641,8 @@ def main():
     model = load_model(ckpt_path, device)
     comp_map = {c: i for i, c in enumerate(COMPOSERS)}
 
+    print(f"Repetition mode: {args.repetition_mode}")
+
     for idx in range(args.n):
         if args.composer:
             cname = args.composer.lower()
@@ -499,6 +665,8 @@ def main():
                               repetition_penalty=args.repetition_penalty,
                               presence_penalty=args.presence_penalty,
                               ngram_penalty=args.ngram_penalty,
+                              repetition_mode=args.repetition_mode,
+                              motif_return_bonus=args.motif_bonus,
                               device=device)
 
         n_bars = sum(1 for t in tokens if t == BAR)
@@ -527,3 +695,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -159,7 +159,7 @@
 
 ### Experiment 1.3 — Smarter Repetition Control
 
-**Status:** ⬜ Not started
+**Status:** ✅ Done (smart mode: motif-aware penalties, motif return bonus)
 **Hypothesis:** The current anti-repetition penalties suppress musical motif repetition along with degenerate loops. A smarter system can distinguish "good repetition" (motifs) from "bad repetition" (stuck loops).
 **Confidence:** Medium
 

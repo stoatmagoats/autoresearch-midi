@@ -153,9 +153,11 @@ soundfont /usr/share/soundfonts/FluidR3_GM.sf2
 | `--max-tokens` | 4096 | Maximum tokens to generate |
 | `--bars` | None | Stop after N bars (e.g. 32 ≈ 30s at 120 BPM) |
 | `--tempo` | 120 | Playback tempo in BPM |
+| `--repetition-mode` | smart | `smart` (motif-aware), `aggressive` (old flat), `off` |
 | `--repetition-penalty` | 1.2 | Multiplicative penalty for repeated pitch/dur/vel tokens |
 | `--presence-penalty` | 0.3 | Additive penalty for recently seen content tokens |
 | `--ngram-penalty` | 2.0 | Penalty for repeating n-gram patterns (0=off) |
+| `--motif-bonus` | 0.4 | Logit bonus for pitches from 2-8 bars ago (smart mode) |
 
 ## AMD ROCm Specifics
 - **GPU**: AMD Radeon 8060S (gfx1151, RDNA 3.5, 96GB unified memory)
