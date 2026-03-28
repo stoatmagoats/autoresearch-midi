@@ -1,12 +1,15 @@
 """
-Autoresearch pretraining script. Single-GPU, single-file.
-Cherry-picked and simplified from nanochat.
+MIDI music generation training script. Single-GPU, single-file.
+Adapted from autoresearch pretraining for REMI-style MIDI token prediction.
 Usage: uv run train.py
 """
 
 import os
+import json
+import signal
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
 
 import gc
 import math
@@ -20,14 +23,9 @@ import torch.nn.functional as F
 # Detect AMD ROCm vs NVIDIA CUDA
 IS_ROCM = hasattr(torch.version, 'hip') and torch.version.hip is not None
 
-if not IS_ROCM:
-    from kernels import get_kernel
-    cap = torch.cuda.get_device_capability()
-    # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-    fa3 = get_kernel(repo).flash_attn_interface
-else:
-    fa3 = None  # Will use PyTorch SDPA on ROCm (dispatches to AOTriton)
+# Flash Attention 3 (CUDA-only via kernels package) is not used on ROCm.
+# ROCm uses PyTorch SDPA which dispatches to AOTriton.
+fa3 = None
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -318,6 +316,8 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+# Optimizer fused steps: compiled on CUDA, eager on ROCm.
+# The model-level torch.compile (applied later with monkey-patch) is the main speedup.
 _maybe_compile = torch.compile(dynamic=False, fullgraph=True) if not IS_ROCM else lambda fn: fn
 
 @_maybe_compile
@@ -445,16 +445,16 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_muon(group)
 
 # ---------------------------------------------------------------------------
-# Hyperparameters (edit these directly, no CLI flags needed)
+# Hyperparameters — tuned for MIDI music generation
 # ---------------------------------------------------------------------------
 
 # Model architecture
-ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128          # target head dimension for attention
+ASPECT_RATIO = 48       # model_dim = depth * ASPECT_RATIO
+HEAD_DIM = 64           # smaller head dim for more heads at moderate width
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
+TOTAL_BATCH_SIZE = 64 * 2048  # 131072 tokens per optimizer step (1 fwd pass per step)
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
@@ -466,8 +466,99 @@ WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEPTH = 12              # number of transformer layers
+DEVICE_BATCH_SIZE = 64   # per-device batch size (uses ~52GB VRAM, more steps/hr)
+
+# ---------------------------------------------------------------------------
+# Run directory management
+# ---------------------------------------------------------------------------
+
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+RUNS_DIR = os.path.join(PROJECT_DIR, "runs")
+
+def _next_run_dir():
+    """Find the next available run_NNN directory."""
+    os.makedirs(RUNS_DIR, exist_ok=True)
+    existing = [d for d in os.listdir(RUNS_DIR)
+                if d.startswith("run_") and os.path.isdir(os.path.join(RUNS_DIR, d))]
+    if not existing:
+        num = 1
+    else:
+        nums = [int(d.split("_")[1]) for d in existing if d.split("_")[1].isdigit()]
+        num = max(nums) + 1 if nums else 1
+    run_dir = os.path.join(RUNS_DIR, f"run_{num:03d}")
+    os.makedirs(run_dir, exist_ok=True)
+    return run_dir, num
+
+RUN_DIR, RUN_NUM = _next_run_dir()
+print(f"Run directory: {RUN_DIR}")
+
+# Check for checkpoint resumption
+RESUME_RUN = os.environ.get("RESUME_RUN")
+RESUME_CKPT = None
+if RESUME_RUN:
+    resume_dir = os.path.join(RUNS_DIR, f"run_{int(RESUME_RUN):03d}")
+    resume_ckpt_path = os.path.join(resume_dir, "checkpoint.pt")
+    if os.path.exists(resume_ckpt_path):
+        RESUME_CKPT = resume_ckpt_path
+        print(f"Will resume from: {RESUME_CKPT}")
+    else:
+        print(f"WARNING: No checkpoint found at {resume_ckpt_path}, starting fresh")
+
+def _get_hyperparams():
+    """Capture all hyperparameters as a dict for config.json."""
+    return {
+        "TIME_BUDGET": TIME_BUDGET,
+        "DEPTH": DEPTH,
+        "ASPECT_RATIO": ASPECT_RATIO,
+        "HEAD_DIM": HEAD_DIM,
+        "DEVICE_BATCH_SIZE": DEVICE_BATCH_SIZE,
+        "TOTAL_BATCH_SIZE": TOTAL_BATCH_SIZE,
+        "MATRIX_LR": MATRIX_LR,
+        "EMBEDDING_LR": EMBEDDING_LR,
+        "UNEMBEDDING_LR": UNEMBEDDING_LR,
+        "SCALAR_LR": SCALAR_LR,
+        "WEIGHT_DECAY": WEIGHT_DECAY,
+        "ADAM_BETAS": list(ADAM_BETAS),
+        "WARMUP_RATIO": WARMUP_RATIO,
+        "WARMDOWN_RATIO": WARMDOWN_RATIO,
+        "FINAL_LR_FRAC": FINAL_LR_FRAC,
+        "MAX_SEQ_LEN": MAX_SEQ_LEN,
+        "WINDOW_PATTERN": WINDOW_PATTERN,
+    }
+
+# Set up logging to run directory
+import sys as _sys
+_log_path = os.path.join(RUN_DIR, "run.log")
+_log_file = open(_log_path, "w")
+
+class _Tee:
+    """Write to both stdout and log file."""
+    def __init__(self, *streams):
+        self.streams = streams
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+            s.flush()
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+_sys.stdout = _Tee(_sys.__stdout__, _log_file)
+_sys.stderr = _Tee(_sys.__stderr__, _log_file)
+print(f"Logging to {_log_path}")
+
+# Write initial config.json (results will be updated after training)
+_initial_config = {
+    "run_id": f"run_{RUN_NUM:03d}",
+    "status": "running",
+    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    "resumed_from": f"run_{int(RESUME_RUN):03d}" if RESUME_RUN else None,
+    "hyperparameters": _get_hyperparams(),
+}
+with open(os.path.join(RUN_DIR, "config.json"), "w") as _f:
+    json.dump(_initial_config, _f, indent=2)
+print(f"Initial config written to {RUN_DIR}/config.json")
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -490,6 +581,8 @@ _GPU_PEAK_FLOPS = {
     "MI308X": 1307.4e12,
     "MI325X": 1307.4e12,
     "MI250X": 383.0e12,
+    # AMD Radeon (RDNA)
+    "8060S":  139.3e12,
 }
 
 def _detect_peak_flops():
@@ -546,10 +639,80 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-if not IS_ROCM:
-    model = torch.compile(model, dynamic=False)
-else:
-    print("ROCm detected: torch.compile disabled (enable with PyTorch 2.9+ on ROCm)")
+# torch.compile: fix ROCm inductor benchmarking bug, then enable on all platforms.
+# Bug: InductorBenchmarker.benchmark_gpu crashes with ZeroDivisionError when
+# estimated_timing is 0.0 (kernel too fast for CUDA event resolution on gfx1151).
+# Fix: guard the division. Benchmarked at 1.21× speedup on our 12-layer model.
+if IS_ROCM:
+    import torch._inductor.runtime.benchmarking as _benchmarking
+    from torch._inductor.runtime.benchmarking import time_and_count as _tc
+
+    def _patched_benchmark_gpu(self, _callable, estimation_iters=5, memory_warmup_iters=100,
+                               benchmark_iters=100, max_benchmark_duration=25,
+                               return_mode="min", grad_to_none=None, **kwargs):
+        torch.cuda.synchronize()
+        _callable()
+        torch.cuda.synchronize()
+        buffer = torch.empty(self.L2_cache_size // 4, dtype=torch.int, device="cuda")
+        buffer.zero_()
+        event_pairs = self.get_event_pairs(estimation_iters)
+        for s, e in event_pairs:
+            if grad_to_none:
+                for x in grad_to_none:
+                    x.grad = None
+            buffer.zero_(); s.record(); _callable(); e.record()
+        torch.cuda.synchronize()
+        estimated_timing = self.get_event_pairs_min_timing(event_pairs)
+        if estimated_timing > 0:
+            benchmark_iters = max(
+                min(benchmark_iters, int(max_benchmark_duration // estimated_timing)), 1
+            )
+        for _ in range(memory_warmup_iters):
+            buffer.zero_()
+        event_pairs = self.get_event_pairs(benchmark_iters)
+        for s, e in event_pairs:
+            if grad_to_none:
+                for x in grad_to_none:
+                    x.grad = None
+            buffer.zero_(); s.record(); _callable(); e.record()
+        torch.cuda.synchronize()
+        del buffer
+        if return_mode == "all":
+            return [s.elapsed_time(e) for s, e in event_pairs]
+        elif return_mode == "min":
+            bt = self.get_event_pairs_min_timing(event_pairs)
+            return min(estimated_timing, bt) if estimated_timing > 0 else bt
+        else:
+            raise ValueError(f"Unsupported return_mode: {return_mode}")
+
+    _benchmarking.InductorBenchmarker.benchmark_gpu = _tc(_patched_benchmark_gpu)
+    print("ROCm: patched InductorBenchmarker (ZeroDivisionError fix)")
+
+model = torch.compile(model, dynamic=False)
+print("torch.compile: enabled")
+
+# Resume from checkpoint if requested
+resumed_training_time = 0.0
+resumed_step = 0
+resumed_smooth_loss = 0.0
+if RESUME_CKPT:
+    print(f"Loading checkpoint from {RESUME_CKPT}...")
+    ckpt = torch.load(RESUME_CKPT, map_location="cpu", weights_only=False)
+    raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+    raw_model.load_state_dict(ckpt['model_state_dict'])
+    if 'optimizer_state_dict' in ckpt:
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        print(f"  Resumed model + optimizer from step {ckpt.get('step', '?')}, val_bpb={ckpt.get('val_bpb', '?')}")
+    else:
+        print(f"  Resumed model (no optimizer state) from step {ckpt.get('step', '?')}, val_bpb={ckpt.get('val_bpb', '?')}")
+    # Restore training state for pause/resume
+    resumed_training_time = ckpt.get('total_training_time', 0.0)
+    resumed_step = ckpt.get('step', 0)
+    resumed_smooth_loss = ckpt.get('smooth_train_loss', 0.0)
+    if resumed_training_time > 0:
+        remaining = max(0, TIME_BUDGET - resumed_training_time)
+        print(f"  Resuming with {resumed_training_time:.0f}s already trained, {remaining:.0f}s remaining")
+    del ckpt
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -579,10 +742,21 @@ def get_weight_decay(progress):
 # Training loop
 # ---------------------------------------------------------------------------
 
+# SIGINT handler: Ctrl+C pauses training gracefully
+_pause_requested = False
+def _sigint_handler(signum, frame):
+    global _pause_requested
+    if _pause_requested:
+        print("\nForce quit (second Ctrl+C)")
+        exit(1)
+    _pause_requested = True
+    print("\n⏸  Pause requested — finishing current step, then saving checkpoint...")
+signal.signal(signal.SIGINT, _sigint_handler)
+
 t_start_training = time.time()
-smooth_train_loss = 0
-total_training_time = 0
-step = 0
+smooth_train_loss = resumed_smooth_loss
+total_training_time = resumed_training_time
+step = resumed_step
 
 while True:
     torch.cuda.synchronize()
@@ -644,26 +818,104 @@ while True:
     step += 1
 
     # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
+    if step > resumed_step + 10 and total_training_time >= TIME_BUDGET:
         break
 
-print()  # newline after \r training log
+    # Pause requested via Ctrl+C
+    if _pause_requested:
+        break
+
+paused = _pause_requested
+if paused:
+    print("\n⏸  Training paused.")
+else:
+    print()  # newline after \r training log
 
 total_tokens = step * TOTAL_BATCH_SIZE
 
-# Final eval
-model.eval()
-with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+# Final eval (skip if paused — save time, we'll eval on resume completion)
+if not paused:
+    model.eval()
+    with autocast_ctx:
+        val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    print(f"val_bpb: {val_bpb:.6f}")
+else:
+    val_bpb = None
+    print("Skipping val eval (paused — will eval on resume completion)")
 
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / PEAK_BF16_FLOPS if total_training_time > 0 else 0
+effective_steps = step - max(resumed_step, 0)
+steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * max(effective_steps - 10, 1) / max(total_training_time - resumed_training_time, 1) / PEAK_BF16_FLOPS
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
+# Save checkpoint (includes training state for pause/resume)
+checkpoint_path = os.path.join(RUN_DIR, "checkpoint.pt")
+checkpoint_data = {
+    'model_state_dict': model.state_dict() if not hasattr(model, '_orig_mod') else model._orig_mod.state_dict(),
+    'optimizer_state_dict': optimizer.state_dict(),
+    'config': asdict(config),
+    'vocab_size': vocab_size,
+    'step': step,
+    'total_training_time': total_training_time,
+    'smooth_train_loss': smooth_train_loss,
+}
+if val_bpb is not None:
+    checkpoint_data['val_bpb'] = val_bpb
+torch.save(checkpoint_data, checkpoint_path)
+
+# Symlink checkpoint.pt in project root → latest run
+root_ckpt = os.path.join(PROJECT_DIR, "checkpoint.pt")
+try:
+    if os.path.islink(root_ckpt) or os.path.exists(root_ckpt):
+        os.remove(root_ckpt)
+    os.symlink(checkpoint_path, root_ckpt)
+except OSError:
+    pass  # symlink may fail on some filesystems
+print(f"Checkpoint saved to {checkpoint_path}")
+
+# Save config.json with hyperparameters and results
+run_status = "paused" if paused else "completed"
+results = {
+    "val_bpb": val_bpb,
+    "training_seconds": round(total_training_time, 1),
+    "total_seconds": round(t_end - t_start, 1),
+    "peak_vram_mb": round(peak_vram_mb, 1),
+    "mfu_percent": round(steady_state_mfu, 2),
+    "total_tokens_M": round(total_tokens / 1e6, 1),
+    "num_steps": step,
+    "epochs": epoch,
+    "status": run_status,
+}
+run_config = {
+    "run_id": f"run_{RUN_NUM:03d}",
+    "status": run_status,
+    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    "resumed_from": f"run_{int(RESUME_RUN):03d}" if RESUME_RUN else None,
+    "hyperparameters": _get_hyperparams(),
+    "model": {
+        "model_dim": config.n_embd,
+        "n_head": config.n_head,
+        "n_layer": config.n_layer,
+        "num_params_M": round(num_params / 1e6, 1),
+    },
+    "dataset": {
+        "composers": len(tokenizer.composers),
+        "vocab_size": vocab_size,
+    },
+    "results": results,
+}
+config_path = os.path.join(RUN_DIR, "config.json")
+with open(config_path, "w") as f:
+    json.dump(run_config, f, indent=2)
+print(f"Config saved to {config_path}")
+
 print("---")
-print(f"val_bpb:          {val_bpb:.6f}")
+if val_bpb is not None:
+    print(f"val_bpb:          {val_bpb:.6f}")
+else:
+    print(f"val_bpb:          (skipped — paused)")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
@@ -672,3 +924,5 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+if paused:
+    print(f"\n💡 Resume this run with: RESUME_RUN={RUN_NUM} uv run python train.py")

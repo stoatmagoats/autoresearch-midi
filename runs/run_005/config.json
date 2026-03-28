@@ -1,0 +1,46 @@
+{
+  "run_id": "run_005",
+  "timestamp": "2026-03-27T00:49:14-0500",
+  "hyperparameters": {
+    "TIME_BUDGET": 3600,
+    "DEPTH": 12,
+    "ASPECT_RATIO": 48,
+    "HEAD_DIM": 64,
+    "DEVICE_BATCH_SIZE": 96,
+    "TOTAL_BATCH_SIZE": 196608,
+    "MATRIX_LR": 0.04,
+    "EMBEDDING_LR": 0.6,
+    "UNEMBEDDING_LR": 0.004,
+    "SCALAR_LR": 0.5,
+    "WEIGHT_DECAY": 0.2,
+    "ADAM_BETAS": [
+      0.8,
+      0.95
+    ],
+    "WARMUP_RATIO": 0.0,
+    "WARMDOWN_RATIO": 0.5,
+    "FINAL_LR_FRAC": 0.0,
+    "MAX_SEQ_LEN": 2048,
+    "WINDOW_PATTERN": "SSSL"
+  },
+  "model": {
+    "model_dim": 576,
+    "n_head": 9,
+    "n_layer": 12,
+    "num_params_M": 49.3
+  },
+  "dataset": {
+    "composers": 49,
+    "vocab_size": 341
+  },
+  "results": {
+    "val_bpb": 0.886990414072648,
+    "training_seconds": 3602.6,
+    "total_seconds": 3736.9,
+    "peak_vram_mb": 78606.4,
+    "mfu_percent": 7.47,
+    "total_tokens_M": 97.1,
+    "num_steps": 494,
+    "epochs": 3
+  }
+}

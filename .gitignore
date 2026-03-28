@@ -9,15 +9,25 @@ wheels/
 # Virtual environments
 .venv
 worktrees/
-results/
 queue/
 
 # Agent prompt files (generated per-session by launchers)
 CLAUDE.md
-AGENTS.md
 
 # Experimental code/artifacts
 dev/
-
-# Results file
+results/
 results.tsv
+
+# Training artifacts — checkpoints and logs (large binary files)
+runs/**/checkpoint.pt
+runs/**/run.log
+checkpoint.pt
+.midi_cache/
+
+# Data directories (too large for git)
+midi_files/
+generated/
+
+# Triton compilation cache
+.triton/

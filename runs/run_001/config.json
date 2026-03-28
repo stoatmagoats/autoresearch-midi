@@ -1,0 +1,46 @@
+{
+  "run_id": "run_001",
+  "description": "Baseline — 10min, 8-layer, original 292-file dataset",
+  "timestamp": "2026-03-26T17:44:00-05:00",
+  "hyperparameters": {
+    "TIME_BUDGET": 600,
+    "DEPTH": 8,
+    "ASPECT_RATIO": 48,
+    "HEAD_DIM": 64,
+    "DEVICE_BATCH_SIZE": 32,
+    "TOTAL_BATCH_SIZE": 65536,
+    "MATRIX_LR": 0.04,
+    "EMBEDDING_LR": 0.6,
+    "UNEMBEDDING_LR": 0.004,
+    "SCALAR_LR": 0.5,
+    "WEIGHT_DECAY": 0.2,
+    "WARMUP_RATIO": 0.0,
+    "WARMDOWN_RATIO": 0.5,
+    "FINAL_LR_FRAC": 0.0,
+    "MAX_SEQ_LEN": 2048,
+    "WINDOW_PATTERN": "SSSL"
+  },
+  "model": {
+    "model_dim": 384,
+    "n_head": 6,
+    "n_layer": 8,
+    "num_params_M": 14.9
+  },
+  "dataset": {
+    "midi_files": 292,
+    "composers": 19,
+    "total_tokens": 2880000,
+    "vocab_size": 311
+  },
+  "results": {
+    "val_bpb": 2.291823,
+    "training_seconds": 600.4,
+    "total_seconds": 614.7,
+    "peak_vram_mb": 12261.9,
+    "mfu_percent": 5.86,
+    "total_tokens_M": 37.6,
+    "num_steps": 573,
+    "epochs": 15
+  },
+  "notes": "Baseline run. Plays notes but lacks rhythm and harmonic coherence."
+}

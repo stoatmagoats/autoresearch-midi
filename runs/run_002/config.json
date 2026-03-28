@@ -1,0 +1,46 @@
+{
+  "run_id": "run_002",
+  "description": "Extended training — 1hr, 12-layer, original dataset (OVERFITTED)",
+  "timestamp": "2026-03-26T18:16:00-05:00",
+  "hyperparameters": {
+    "TIME_BUDGET": 3600,
+    "DEPTH": 12,
+    "ASPECT_RATIO": 48,
+    "HEAD_DIM": 64,
+    "DEVICE_BATCH_SIZE": 64,
+    "TOTAL_BATCH_SIZE": 131072,
+    "MATRIX_LR": 0.04,
+    "EMBEDDING_LR": 0.6,
+    "UNEMBEDDING_LR": 0.004,
+    "SCALAR_LR": 0.5,
+    "WEIGHT_DECAY": 0.2,
+    "WARMUP_RATIO": 0.0,
+    "WARMDOWN_RATIO": 0.5,
+    "FINAL_LR_FRAC": 0.0,
+    "MAX_SEQ_LEN": 2048,
+    "WINDOW_PATTERN": "SSSL"
+  },
+  "model": {
+    "model_dim": 576,
+    "n_head": 9,
+    "n_layer": 12,
+    "num_params_M": 49.2
+  },
+  "dataset": {
+    "midi_files": 292,
+    "composers": 19,
+    "total_tokens": 2880000,
+    "vocab_size": 311
+  },
+  "results": {
+    "val_bpb": 4.195395,
+    "training_seconds": 3604.3,
+    "total_seconds": 3663.5,
+    "peak_vram_mb": 52583.4,
+    "mfu_percent": 7.42,
+    "total_tokens_M": 95.9,
+    "num_steps": 732,
+    "epochs": 38
+  },
+  "notes": "OVERFITTED. Train loss reached 0.002 but val_bpb 4.20. Model too large for dataset (49.2M params on 2.88M tokens)."
+}

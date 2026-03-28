@@ -1,389 +1,492 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+MIDI data preparation for music generation experiments.
+Tokenizes MIDI files from midi_files/ using REMI-style encoding.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
-
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+    python prepare.py          # tokenize all MIDI files and cache
+    python prepare.py --stats  # show dataset statistics
 """
 
 import os
 import sys
-import time
 import math
+import json
+import random
 import argparse
-import pickle
-from multiprocessing import Pool
+import multiprocessing
+from pathlib import Path
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
+import mido
 import torch
 
 # ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
+# Constants (shared with train.py)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+MAX_SEQ_LEN = 2048
+TIME_BUDGET = 7200         # 2 hours for MIDI training (10× augmented dataset)
+MIDI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "midi_files")
+CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".midi_cache")
+
+# Quantization
+STEPS_PER_BEAT = 4         # 16th-note resolution
+MAX_POS_PER_BAR = 32       # supports up to 8/4 time
+MAX_DUR_STEPS = 64         # max note duration in 16th notes
+NUM_VEL_BINS = 32
+NUM_TEMPO_BINS = 32
+TEMPO_MIN, TEMPO_MAX = 40, 240  # BPM range
+
+# Data split
+VAL_RATIO = 0.1
+SPLIT_SEED = 42
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Token Vocabulary
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+PAD, BOS, EOS, BAR = 0, 1, 2, 3
+NUM_SPECIAL = 4
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+POS_OFF   = NUM_SPECIAL                        # 4
+PITCH_OFF = POS_OFF + MAX_POS_PER_BAR           # 36
+DUR_OFF   = PITCH_OFF + 128                     # 164
+VEL_OFF   = DUR_OFF + MAX_DUR_STEPS             # 228
+TEMPO_OFF = VEL_OFF + NUM_VEL_BINS              # 260
+COMP_OFF  = TEMPO_OFF + NUM_TEMPO_BINS           # 292
 
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+def _get_composers():
+    if not os.path.isdir(MIDI_DIR):
+        return []
+    return sorted(d for d in os.listdir(MIDI_DIR)
+                  if os.path.isdir(os.path.join(MIDI_DIR, d)))
 
-# ---------------------------------------------------------------------------
-# Data download
-# ---------------------------------------------------------------------------
+COMPOSERS = _get_composers()
+VOCAB_SIZE = COMP_OFF + len(COMPOSERS)
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
+# --- Encoding helpers ---
+def tok_pos(p):   return POS_OFF   + min(max(p, 0), MAX_POS_PER_BAR - 1)
+def tok_pitch(p): return PITCH_OFF + min(max(p, 0), 127)
+def tok_dur(d):   return DUR_OFF   + min(max(d, 1), MAX_DUR_STEPS) - 1
+def tok_vel(v):   return VEL_OFF   + min(max(v, 0), NUM_VEL_BINS - 1)
+def tok_tempo(t): return TEMPO_OFF + min(max(t, 0), NUM_TEMPO_BINS - 1)
+def tok_comp(i):  return COMP_OFF  + i
 
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+# --- Decoding helpers ---
+def dec_pos(t):   return t - POS_OFF
+def dec_pitch(t): return t - PITCH_OFF
+def dec_dur(t):   return (t - DUR_OFF) + 1        # 1-indexed
+def dec_vel(t):   return t - VEL_OFF
+def dec_tempo(t): return t - TEMPO_OFF
+def dec_comp(t):  return t - COMP_OFF
 
+def is_pos(t):   return POS_OFF   <= t < POS_OFF   + MAX_POS_PER_BAR
+def is_pitch(t): return PITCH_OFF <= t < PITCH_OFF + 128
+def is_dur(t):   return DUR_OFF   <= t < DUR_OFF   + MAX_DUR_STEPS
+def is_vel(t):   return VEL_OFF   <= t < VEL_OFF   + NUM_VEL_BINS
+def is_tempo(t): return TEMPO_OFF <= t < TEMPO_OFF + NUM_TEMPO_BINS
+def is_comp(t):  return COMP_OFF  <= t < COMP_OFF  + len(COMPOSERS)
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+# --- Velocity / tempo quantization ---
+def vel_to_bin(v):   return min(v * NUM_VEL_BINS // 128, NUM_VEL_BINS - 1)
+def bin_to_vel(b):   return int((b + 0.5) * 128 / NUM_VEL_BINS)
+def bpm_to_bin(bpm):
+    bpm = max(TEMPO_MIN, min(TEMPO_MAX, bpm))
+    return min(int((bpm - TEMPO_MIN) / (TEMPO_MAX - TEMPO_MIN) * NUM_TEMPO_BINS),
+               NUM_TEMPO_BINS - 1)
+def bin_to_bpm(b):
+    return int(TEMPO_MIN + (b + 0.5) / NUM_TEMPO_BINS * (TEMPO_MAX - TEMPO_MIN))
 
 # ---------------------------------------------------------------------------
-# Tokenizer training
+# MIDI Parsing → tokens
 # ---------------------------------------------------------------------------
 
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+# Piano range for transposition filtering
+PIANO_MIN, PIANO_MAX = 21, 108  # A0 to C8
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+def _parse_midi(filepath):
+    """Parse MIDI → list of (start_tick, pitch, dur_ticks, velocity), metadata."""
+    mid = mido.MidiFile(filepath)
+    tpb = mid.ticks_per_beat
+    tempo_us = 500000       # default 120 BPM
+    ts_num, ts_den = 4, 4
+
+    notes = []
+    for track in mid.tracks:
+        t = 0
+        active = {}
+        for msg in track:
+            t += msg.time
+            if msg.type == 'set_tempo':
+                tempo_us = msg.tempo
+            elif msg.type == 'time_signature':
+                ts_num, ts_den = msg.numerator, msg.denominator
+            elif msg.type == 'note_on' and msg.velocity > 0:
+                active[msg.note] = (t, msg.velocity)
+            elif msg.type in ('note_off',) or (msg.type == 'note_on' and msg.velocity == 0):
+                if msg.note in active:
+                    s, v = active.pop(msg.note)
+                    if t - s > 0:
+                        notes.append((s, msg.note, t - s, v))
+
+    notes.sort(key=lambda x: (x[0], x[1]))
+    bpm = 60_000_000 / tempo_us
+    return notes, tpb, bpm, ts_num, ts_den
 
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+def transpose_notes(notes, semitones):
+    """Transpose all notes by N semitones. Returns None if any note goes out of piano range."""
+    transposed = []
+    for start, pitch, dur, vel in notes:
+        new_pitch = pitch + semitones
+        if new_pitch < PIANO_MIN or new_pitch > PIANO_MAX:
+            return None  # skip this transposition entirely
+        transposed.append((start, new_pitch, dur, vel))
+    return transposed
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+def _tokenize_from_notes(notes, tpb, bpm, ts_num, ts_den, composer_idx):
+    """Quantize parsed notes and build REMI token sequence.
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
+    This is the shared core used by both tokenize_file() (original) and
+    the transposition augmentation path.
+    """
+    if not notes:
+        return []
 
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
+    ticks_per_step = tpb // STEPS_PER_BEAT
+    beats_per_bar = ts_num * (4 / ts_den)
+    steps_per_bar = int(beats_per_bar * STEPS_PER_BEAT)
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+    # Quantize
+    qnotes = []
+    for st, pit, dur, vel in notes:
+        s = round(st / ticks_per_step)
+        d = max(1, min(round(dur / ticks_per_step), MAX_DUR_STEPS))
+        bar = s // steps_per_bar
+        pos = s % steps_per_bar
+        qnotes.append((bar, pos, pit, d, vel_to_bin(vel)))
+    qnotes.sort(key=lambda x: (x[0], x[1], x[2]))
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
-    )
+    # Build tokens
+    tokens = [BOS, tok_comp(composer_idx), tok_tempo(bpm_to_bin(bpm))]
+    cur_bar = -1
+    for bar, pos, pit, dur, vb in qnotes:
+        while cur_bar < bar:
+            tokens.append(BAR)
+            cur_bar += 1
+        tokens.extend([tok_pos(pos), tok_pitch(pit), tok_dur(dur), tok_vel(vb)])
+    tokens.append(EOS)
+    return tokens
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+def tokenize_file(filepath, composer_idx):
+    """Tokenize a single MIDI file → list[int]."""
+    notes, tpb, bpm, ts_num, ts_den = _parse_midi(filepath)
+    return _tokenize_from_notes(notes, tpb, bpm, ts_num, ts_den, composer_idx)
 
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
+# ---------------------------------------------------------------------------
+# Tokens → MIDI
+# ---------------------------------------------------------------------------
+
+def tokens_to_midi(tokens, output_path=None, default_bpm=120):
+    """Convert token list back to a playable MIDI file."""
+    mid = mido.MidiFile(ticks_per_beat=480)
+    track = mido.MidiTrack()
+    mid.tracks.append(track)
+    tps = 480 // STEPS_PER_BEAT           # ticks per step (120)
+    steps_per_bar = 4 * STEPS_PER_BEAT    # assume 4/4
+
+    bpm = default_bpm
+    notes = []
+    cur_bar = -1
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t in (BOS, EOS, PAD) or is_comp(t):
+            i += 1; continue
+        if is_tempo(t):
+            bpm = bin_to_bpm(dec_tempo(t)); i += 1; continue
+        if t == BAR:
+            cur_bar += 1; i += 1; continue
+        if is_pos(t) and i + 3 < len(tokens):
+            p, pi, di, vi = t, tokens[i+1], tokens[i+2], tokens[i+3]
+            if is_pitch(pi) and is_dur(di) and is_vel(vi):
+                bar = max(0, cur_bar)
+                abs_step = bar * steps_per_bar + dec_pos(p)
+                notes.append((abs_step * tps, dec_pitch(pi),
+                              dec_dur(di) * tps, bin_to_vel(dec_vel(vi))))
+                i += 4; continue
+        i += 1
+
+    # Build MIDI messages
+    track.append(mido.MetaMessage('set_tempo', tempo=mido.bpm2tempo(bpm), time=0))
+    track.append(mido.MetaMessage('time_signature', numerator=4, denominator=4, time=0))
+
+    events = []
+    for st, pit, dur, vel in notes:
+        events.append((st, 1, pit, vel))       # note_on
+        events.append((st + dur, 0, pit, 0))   # note_off
+    events.sort(key=lambda x: (x[0], x[1]))
+
+    last = 0
+    for abs_t, is_on, pit, vel in events:
+        delta = abs_t - last
+        if is_on:
+            track.append(mido.Message('note_on', note=pit, velocity=vel, time=delta))
         else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+            track.append(mido.Message('note_off', note=pit, velocity=0, time=delta))
+        last = abs_t
+    track.append(mido.MetaMessage('end_of_track', time=0))
 
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+    if output_path:
+        mid.save(output_path)
+    return mid
 
 # ---------------------------------------------------------------------------
 # Runtime utilities (imported by train.py)
 # ---------------------------------------------------------------------------
 
 class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
+    """Minimal wrapper compatible with train.py interface."""
+    def __init__(self):
+        self._vocab_size = VOCAB_SIZE
+        self.composers = COMPOSERS
+        self.composer_to_idx = {c: i for i, c in enumerate(COMPOSERS)}
 
     @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
+    def from_directory(cls):
+        return cls()
 
     def get_vocab_size(self):
-        return self.enc.n_vocab
+        return self._vocab_size
 
     def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
+        return BOS
 
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+def make_dataloader(tokenizer, B, T, split):
+    """Yield (inputs, targets, epoch) from cached token tensors."""
+    assert split in ("train", "val")
+    path = os.path.join(CACHE_DIR, f"{split}.pt")
+    if not os.path.exists(path):
+        raise RuntimeError(f"Cache not found: {path}. Run prepare.py first.")
 
+    data = torch.load(path, map_location="cpu", weights_only=True)
+    n = len(data)
+    row_len = T + 1
 
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
+    # Pre-allocate pinned CPU + GPU buffers
+    cpu_buf = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
+    gpu_buf = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
+    cpu_x = cpu_buf[:B * T].view(B, T)
+    cpu_y = cpu_buf[B * T:].view(B, T)
+    x = gpu_buf[:B * T].view(B, T)
+    y = gpu_buf[B * T:].view(B, T)
+
     epoch = 1
+    pos = 0
     while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
+        for r in range(B):
+            if pos + row_len > n:
+                pos = 0
+                epoch += 1
+            cpu_x[r] = data[pos:pos + T]
+            cpu_y[r] = data[pos + 1:pos + row_len]
+            pos += T          # stride by T (non-overlapping)
+        gpu_buf.copy_(cpu_buf, non_blocking=True)
+        yield x, y, epoch
 
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
-    """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
-    """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
-
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
-
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
-
-# ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
-# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def evaluate_bpb(model, tokenizer, batch_size):
-    """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
-    """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
+    """Bits-per-token on validation set (reported as val_bpb for compat)."""
+    path = os.path.join(CACHE_DIR, "val.pt")
+    val_data = torch.load(path, map_location="cpu", weights_only=True)
+    n_val = len(val_data)
+    tpb = batch_size * MAX_SEQ_LEN
+    steps = max(1, n_val // tpb)
+
+    loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
+    total_loss, total_count = 0.0, 0
     for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+        xi, yi, _ = next(loader)
+        mask = (yi != PAD).float()
+        loss_flat = model(xi, yi, reduction='none').view(-1)
+        m = mask.view(-1)
+        total_loss += (loss_flat * m).sum().item()
+        total_count += m.sum().item()
+
+    if total_count == 0:
+        return float('inf')
+    return total_loss / (math.log(2) * total_count)
 
 # ---------------------------------------------------------------------------
-# Main
+# Main — tokenize MIDI files and cache
 # ---------------------------------------------------------------------------
+
+# Transposition augmentation range: -5 to +6 semitones (skip 0 = original)
+TRANSPOSE_RANGE = range(-5, 7)  # [-5, -4, ..., -1, 0, 1, ..., 6]
+
+
+def _process_one_file(args):
+    """Process a single MIDI file: tokenize original + all transpositions.
+
+    Designed to run in a multiprocessing.Pool worker.
+    Returns (sequences, skipped, n_originals, n_transposed, error_msg).
+    """
+    fp, comp, composer_idx_map = args
+    cidx = composer_idx_map[comp]
+    sequences = []
+    n_originals = 0
+    n_transposed = 0
+
+    try:
+        notes, tpb, bpm, ts_num, ts_den = _parse_midi(fp)
+
+        # Original
+        toks = _tokenize_from_notes(notes, tpb, bpm, ts_num, ts_den, cidx)
+        if len(toks) > 10:
+            sequences.append(toks)
+            n_originals = 1
+        else:
+            return sequences, 1, 0, 0, None  # skipped
+
+        # Transpositions
+        for shift in TRANSPOSE_RANGE:
+            if shift == 0:
+                continue
+            t_notes = transpose_notes(notes, shift)
+            if t_notes is not None:
+                toks_t = _tokenize_from_notes(t_notes, tpb, bpm, ts_num, ts_den, cidx)
+                if len(toks_t) > 10:
+                    sequences.append(toks_t)
+                    n_transposed += 1
+
+    except Exception as e:
+        return [], 1, 0, 0, f"  Skipped {fp}: {e}"
+
+    return sequences, 0, n_originals, n_transposed, None
+
+
+def _augment_with_transpositions(parsed_entries, composer_idx_map):
+    """Generate original + transposed token sequences from parsed MIDI entries.
+
+    Uses multiprocessing to parallelize across CPU cores.
+
+    Args:
+        parsed_entries: list of (filepath, composer_name) tuples
+        composer_idx_map: dict mapping composer name → index
+
+    Returns:
+        (sequences, skipped, n_originals, n_transposed)
+        where sequences is a list of token lists
+    """
+    work_items = [(fp, comp, composer_idx_map) for fp, comp in parsed_entries]
+    n_workers = min(multiprocessing.cpu_count(), len(work_items))
+
+    sequences = []
+    skipped = 0
+    n_originals = 0
+    n_transposed = 0
+
+    with multiprocessing.Pool(n_workers) as pool:
+        for result in pool.imap_unordered(_process_one_file, work_items, chunksize=16):
+            seqs, sk, no, nt, err = result
+            sequences.extend(seqs)
+            skipped += sk
+            n_originals += no
+            n_transposed += nt
+            if err:
+                print(err)
+
+    return sequences, skipped, n_originals, n_transposed
+
+
+def prepare_data():
+    os.makedirs(CACHE_DIR, exist_ok=True)
+
+    comp_map = {c: i for i, c in enumerate(COMPOSERS)}
+    entries = []
+    for comp in COMPOSERS:
+        cdir = os.path.join(MIDI_DIR, comp)
+        for fn in sorted(os.listdir(cdir)):
+            if fn.lower().endswith(('.mid', '.midi')):
+                entries.append((os.path.join(cdir, fn), comp))
+
+    print(f"Found {len(entries)} MIDI files from {len(COMPOSERS)} composers")
+    print(f"Transposition augmentation: shifts {list(TRANSPOSE_RANGE)} (skip 0)")
+
+    # -----------------------------------------------------------------------
+    # Split ORIGINAL files into train/val FIRST, then augment within each split
+    # This prevents data leakage (a val piece's transposition in training).
+    # -----------------------------------------------------------------------
+    rng = random.Random(SPLIT_SEED)
+    idx = list(range(len(entries)))
+    rng.shuffle(idx)
+    n_val = max(1, int(len(entries) * VAL_RATIO))
+    val_indices = set(idx[:n_val])
+
+    train_entries = [entries[i] for i in range(len(entries)) if i not in val_indices]
+    val_entries   = [entries[i] for i in range(len(entries)) if i in val_indices]
+    print(f"Split: {len(train_entries)} train files, {len(val_entries)} val files (before augmentation)")
+
+    # Augment each split independently
+    print("Tokenizing + augmenting train split...")
+    train_seqs, train_skip, train_orig, train_trans = _augment_with_transpositions(train_entries, comp_map)
+    print(f"  Train: {train_orig} originals + {train_trans} transpositions = {len(train_seqs)} sequences ({train_skip} skipped)")
+
+    print("Tokenizing + augmenting val split...")
+    val_seqs, val_skip, val_orig, val_trans = _augment_with_transpositions(val_entries, comp_map)
+    print(f"  Val:   {val_orig} originals + {val_trans} transpositions = {len(val_seqs)} sequences ({val_skip} skipped)")
+
+    total_seqs = len(train_seqs) + len(val_seqs)
+    total_skip = train_skip + val_skip
+    print(f"\nTotal: {total_seqs} sequences ({train_orig + val_orig} originals + {train_trans + val_trans} transpositions, {total_skip} skipped)")
+    print(f"Vocab size: {VOCAB_SIZE}")
+
+    # Shuffle sequences before flattening — prevents transpositions of the same
+    # piece from being adjacent, which would cause near-duplicate consecutive batches.
+    rng.shuffle(train_seqs)
+    rng.shuffle(val_seqs)
+
+    # Flatten
+    train_flat = [t for s in train_seqs for t in s]
+    val_flat   = [t for s in val_seqs   for t in s]
+
+    print(f"Train: {len(train_seqs)} sequences, {len(train_flat):,} tokens")
+    print(f"Val:   {len(val_seqs)} sequences, {len(val_flat):,} tokens")
+    print(f"Augmentation factor: {len(train_flat) / max(1, sum(len(s) for s in train_seqs[:train_orig])) :.1f}×" if train_orig > 0 else "")
+
+    torch.save(torch.tensor(train_flat, dtype=torch.long),
+               os.path.join(CACHE_DIR, "train.pt"))
+    torch.save(torch.tensor(val_flat, dtype=torch.long),
+               os.path.join(CACHE_DIR, "val.pt"))
+
+    meta = dict(
+        vocab_size=VOCAB_SIZE, composers=COMPOSERS,
+        n_train_originals=train_orig, n_val_originals=val_orig,
+        n_train_transpositions=train_trans, n_val_transpositions=val_trans,
+        n_train=len(train_seqs), n_val=len(val_seqs),
+        train_tokens=len(train_flat), val_tokens=len(val_flat),
+        transpose_range=list(TRANSPOSE_RANGE),
+    )
+    with open(os.path.join(CACHE_DIR, "metadata.json"), 'w') as f:
+        json.dump(meta, f, indent=2)
+    print(f"Cached to {CACHE_DIR}")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--stats", action="store_true")
+    args = ap.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
-
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
-
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    if args.stats:
+        mp = os.path.join(CACHE_DIR, "metadata.json")
+        if os.path.exists(mp):
+            print(json.dumps(json.load(open(mp)), indent=2))
+        else:
+            print("No cache found. Run prepare.py first.")
+    else:
+        prepare_data()
+        print("\nDone! Ready to train.")

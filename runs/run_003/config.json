@@ -1,0 +1,46 @@
+{
+  "run_id": "run_003",
+  "description": "Expanded HF dataset — 1hr, 8-layer, 3188 MIDI files from 49 composers",
+  "timestamp": "2026-03-26T19:35:00-05:00",
+  "hyperparameters": {
+    "TIME_BUDGET": 3600,
+    "DEPTH": 8,
+    "ASPECT_RATIO": 48,
+    "HEAD_DIM": 64,
+    "DEVICE_BATCH_SIZE": 32,
+    "TOTAL_BATCH_SIZE": 65536,
+    "MATRIX_LR": 0.04,
+    "EMBEDDING_LR": 0.6,
+    "UNEMBEDDING_LR": 0.004,
+    "SCALAR_LR": 0.5,
+    "WEIGHT_DECAY": 0.2,
+    "WARMUP_RATIO": 0.0,
+    "WARMDOWN_RATIO": 0.5,
+    "FINAL_LR_FRAC": 0.0,
+    "MAX_SEQ_LEN": 2048,
+    "WINDOW_PATTERN": "SSSL"
+  },
+  "model": {
+    "model_dim": 384,
+    "n_head": 6,
+    "n_layer": 8,
+    "num_params_M": 14.9
+  },
+  "dataset": {
+    "midi_files": 3188,
+    "composers": 49,
+    "total_tokens": 43706789,
+    "vocab_size": 341
+  },
+  "results": {
+    "val_bpb": 0.889120,
+    "training_seconds": 3600.8,
+    "total_seconds": 3637.3,
+    "peak_vram_mb": 12262.5,
+    "mfu_percent": 5.85,
+    "total_tokens_M": 221.3,
+    "num_steps": 3377,
+    "epochs": 6
+  },
+  "notes": "Best run so far. 15x more data was the key improvement. No overfitting (only 6 epochs)."
+}
