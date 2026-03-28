@@ -1,0 +1,21 @@
+Logging to /home/jonathan/Documents/projects/autoresearch/runs/run_009/run.log
+Initial config written to /home/jonathan/Documents/projects/autoresearch/runs/run_009/config.json
+Detected GPU: Radeon 8060S Graphics -> peak BF16 FLOPS: 1.4e+14
+Vocab size: 341
+Model config: {'sequence_len': 2048, 'vocab_size': 341, 'n_layer': 12, 'n_head': 9, 'n_kv_head': 9, 'n_embd': 576, 'window_pattern': 'SSSL'}
+Parameter counts:
+  wte                     : 196,416
+  value_embeds            : 1,178,496
+  lm_head                 : 196,416
+  transformer_matrices    : 47,777,472
+  scalars                 : 24
+  total                   : 49,348,824
+Estimated FLOPs per token: 3.940116e+08
+Scaling AdamW LRs by 1/sqrt(576/768) = 1.154701
+ROCm: patched InductorBenchmarker (ZeroDivisionError fix)
+torch.compile: enabled
+Loading checkpoint from /home/jonathan/Documents/projects/autoresearch/runs/run_008/checkpoint.pt...
+  Resumed model + optimizer from step 3573, val_bpb=0.7481193737891134
+  Resuming with 7201s already trained, 0s remaining
+Time budget: 7200s
+Gradient accumulation steps: 1

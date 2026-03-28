@@ -715,8 +715,10 @@ if RESUME_CKPT:
     resumed_step = ckpt.get('step', 0)
     resumed_smooth_loss = ckpt.get('smooth_train_loss', 0.0)
     if resumed_training_time > 0:
-        remaining = max(0, TIME_BUDGET - resumed_training_time)
-        print(f"  Resuming with {resumed_training_time:.0f}s already trained, {remaining:.0f}s remaining")
+        # Extend budget so this session trains for a full TIME_BUDGET on top of previous
+        TIME_BUDGET = resumed_training_time + TIME_BUDGET
+        remaining = TIME_BUDGET - resumed_training_time
+        print(f"  Resuming with {resumed_training_time:.0f}s already trained, {remaining:.0f}s new budget")
     del ckpt
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")

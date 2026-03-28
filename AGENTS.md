@@ -9,7 +9,7 @@
 ```
 prepare.py          — MIDI tokenizer (REMI-style), dataloader, evaluation
 train.py            — GPT model, MuonAdamW optimizer, training loop
-generate.py         — Autoregressive sampling → MIDI file output
+generate.py         — Autoregressive sampling with KV-cache → MIDI file output
 analyze_midi.py     — Dataset quality analysis (flags bad files for removal)
 download_hf_midi.py — Downloads MIDI datasets from HuggingFace
 JOURNAL.md          — Experiment journal: per-run tweaks, results, and learnings
@@ -59,11 +59,8 @@ Sequence format: `BOS COMPOSER TEMPO BAR [notes...] BAR [notes...] ... EOS`
 
 ### One-time setup
 ```bash
-# Install dependencies (torch is installed separately for ROCm)
+# Install all dependencies (ROCm torch+triton are configured in pyproject.toml)
 uv sync
-uv pip install --no-cache-dir \
-  https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/triton-3.5.1+rocm7.2.1.gita272dfa8-cp310-cp310-linux_x86_64.whl \
-  https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/torch-2.9.1+rocm7.2.1.lw.gitff65f5bc-cp310-cp310-linux_x86_64.whl
 
 # Tokenize MIDI files (creates .midi_cache/)
 uv run python prepare.py
@@ -71,17 +68,15 @@ uv run python prepare.py
 
 ### Training (~2 hours)
 
-**Important:** Use `.venv/bin/python` instead of `uv run` — `uv run` can overwrite the ROCm PyTorch with the CUDA version.
-
 ```bash
 # Train the model (auto-creates runs/run_NNN/ with checkpoint, config, log)
-.venv/bin/python train.py
+uv run python train.py
 
 # Resume training from a previous run
-RESUME_RUN=6 .venv/bin/python train.py
+RESUME_RUN=6 uv run python train.py
 
 # Detachable training (survives SSH disconnect):
-tmux new -s train '.venv/bin/python train.py'
+tmux new -s train 'uv run python train.py'
 # Detach: Ctrl+B then D
 # Reattach: tmux attach -t train
 
@@ -164,16 +159,17 @@ soundfont /usr/share/soundfonts/FluidR3_GM.sf2
 
 ## AMD ROCm Specifics
 - **GPU**: AMD Radeon 8060S (gfx1151, RDNA 3.5, 96GB unified memory)
-- **PyTorch**: `2.9.1+rocm7.2.1` from `repo.radeon.com` (has native gfx1151 support)
-- **Triton**: `3.5.1+rocm7.2.1` (ROCm-specific build)
+- **PyTorch**: `2.9.1+rocm7.2.1` from `repo.radeon.com` (configured in `pyproject.toml` via `[tool.uv.sources]`)
+- **Triton**: `3.5.1+rocm7.2.1` (ROCm-specific build, also in `pyproject.toml`)
 - **ROCm SDK**: 7.2.0 (system-level, via `pacman -S rocm-hip-sdk`)
 - **Attention**: PyTorch SDPA with experimental AOTriton (`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`)
 - **torch.compile**: Enabled with monkey-patch (fixes ZeroDivisionError in InductorBenchmarker, ~1.2× speedup)
-- Peak VRAM: ~52 GB (batch 64)
+- **Generation**: KV-cache enabled (~150 tok/s), with live progress output
+- Peak VRAM: ~35 GB (training, batch 64)
 
 ## Metric
 
-**`val_bpb`** (bits per token) — lower is better. Cross-entropy loss on held-out pieces converted to bits. Current best: **0.887** (Run 5, 49.2M params, 2×1hr training).
+**`val_bpb`** (bits per token) — lower is better. Cross-entropy loss on held-out pieces converted to bits. Current best: **0.849** (Run 10, 49.2M params, 4hr training with transposition augmentation).
 
 ## Improving Quality
 

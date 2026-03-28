@@ -1,7 +1,7 @@
 {
   "run_id": "run_008",
-  "status": "running",
-  "timestamp": "2026-03-28T00:47:45-0500",
+  "status": "completed",
+  "timestamp": "2026-03-28T02:53:46-0500",
   "resumed_from": "run_006",
   "hyperparameters": {
     "TIME_BUDGET": 7200,
@@ -24,5 +24,26 @@
     "FINAL_LR_FRAC": 0.0,
     "MAX_SEQ_LEN": 2048,
     "WINDOW_PATTERN": "SSSL"
+  },
+  "model": {
+    "model_dim": 576,
+    "n_head": 9,
+    "n_layer": 12,
+    "num_params_M": 49.3
+  },
+  "dataset": {
+    "composers": 49,
+    "vocab_size": 341
+  },
+  "results": {
+    "val_bpb": 0.7481193737891134,
+    "training_seconds": 7201.4,
+    "total_seconds": 7561.5,
+    "peak_vram_mb": 34651.0,
+    "mfu_percent": 10.9,
+    "total_tokens_M": 468.3,
+    "num_steps": 3573,
+    "epochs": 1,
+    "status": "completed"
   }
 }

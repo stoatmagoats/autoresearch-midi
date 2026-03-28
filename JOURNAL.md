@@ -135,6 +135,7 @@
 | 004 | 12 | 49.3M | 3,188 files (43.7M tok) | 1h | 197K | 3 | 1.021 | Undercooked |
 | 005 | 12 | 49.3M | 3,188 files (43.7M tok) | 1h | 197K | 3 | **0.887** | Extended training |
 | 006 | 12 | 49.3M | 25,829 seqs (377M tok) | 2h | 131K | 0.5 | **0.784** | ✅ Transposition aug |
+| 010 | 12 | 49.3M | 25,829 seqs (377M tok) | 4h | 131K | 1 | **0.849** | ✅ Extended aug training |
 
 ---
 
@@ -152,6 +153,10 @@
 
 6. **Smaller batch = more steps/hr.** Reducing batch from 96→64 gave 1,446 steps (vs 494 at batch 96) — 2.9× more gradient updates, dropping VRAM from 78.6→52.6 GB.
 
+7. **KV-cache is essential for generation.** Without KV-cache, generation was O(n²) — taking 10+ minutes per piece. Adding KV-cache made it O(n), achieving ~150 tok/s and generating pieces in 10-30 seconds.
+
+8. **Keep ROCm torch pinned in pyproject.toml.** Direct URL sources in `[tool.uv.sources]` prevent `uv run`/`uv sync` from overwriting ROCm PyTorch with the CUDA version.
+
 ---
 
 ## Next Steps
@@ -161,6 +166,7 @@ See **EXPERIMENTS.md** for the full phased experiment plan (9 experiments across
 **Immediate priorities:**
 - [x] Experiment 1.1: Extended training — resume Run 005 for 2-4 hours with batch size 64
 - [x] Experiment 1.2: Transposition augmentation — 10× more data via pitch shifting
-- [ ] Run 007/008: Extended training on augmented data (resume Run 006 with torch.compile)
+- [x] Run 010: Extended training on augmented data (4hr, resumed from Run 008, val_bpb=0.849)
+- [x] KV-cache generation — ~150 tok/s with live progress output
 - [ ] Experiment 1.3: Smarter repetition control — motif-aware penalties in generate.py
-
+- [ ] Experiment 2.1: Chord tokens (REMI+) for explicit harmony

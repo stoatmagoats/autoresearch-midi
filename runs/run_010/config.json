@@ -1,0 +1,49 @@
+{
+  "run_id": "run_010",
+  "status": "completed",
+  "timestamp": "2026-03-28T15:06:34-0500",
+  "resumed_from": "run_008",
+  "hyperparameters": {
+    "TIME_BUDGET": 14401.393909692764,
+    "DEPTH": 12,
+    "ASPECT_RATIO": 48,
+    "HEAD_DIM": 64,
+    "DEVICE_BATCH_SIZE": 64,
+    "TOTAL_BATCH_SIZE": 131072,
+    "MATRIX_LR": 0.04,
+    "EMBEDDING_LR": 0.6,
+    "UNEMBEDDING_LR": 0.004,
+    "SCALAR_LR": 0.5,
+    "WEIGHT_DECAY": 0.2,
+    "ADAM_BETAS": [
+      0.8,
+      0.95
+    ],
+    "WARMUP_RATIO": 0.0,
+    "WARMDOWN_RATIO": 0.5,
+    "FINAL_LR_FRAC": 0.0,
+    "MAX_SEQ_LEN": 2048,
+    "WINDOW_PATTERN": "SSSL"
+  },
+  "model": {
+    "model_dim": 576,
+    "n_head": 9,
+    "n_layer": 12,
+    "num_params_M": 49.3
+  },
+  "dataset": {
+    "composers": 49,
+    "vocab_size": 341
+  },
+  "results": {
+    "val_bpb": 0.8488159939564215,
+    "training_seconds": 14404.3,
+    "total_seconds": 7561.7,
+    "peak_vram_mb": 34651.0,
+    "mfu_percent": 11.0,
+    "total_tokens_M": 749.9,
+    "num_steps": 5721,
+    "epochs": 1,
+    "status": "completed"
+  }
+}

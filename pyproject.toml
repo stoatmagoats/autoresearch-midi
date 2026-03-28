@@ -3,10 +3,11 @@ name = "autoresearch"
 version = "0.1.0"
 description = "Autonomous pretraining research swarm"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.11"
 dependencies = [
     "kernels>=0.11.7",
     "matplotlib>=3.10.8",
+    "mido>=1.3.3",
     "numpy>=2.2.6",
     "pandas>=2.3.3",
     "pyarrow>=21.0.0",
@@ -14,14 +15,9 @@ dependencies = [
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
     "torch==2.9.1",
+    "triton==3.5.1",
 ]
 
 [tool.uv.sources]
-torch = [
-    { index = "pytorch-cu128" },
-]
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
+torch = { url = "https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/torch-2.9.1+rocm7.2.1.lw.gitff65f5bc-cp310-cp310-linux_x86_64.whl" }
+triton = { url = "https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.1/triton-3.5.1+rocm7.2.1.gita272dfa8-cp310-cp310-linux_x86_64.whl" }

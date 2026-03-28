@@ -14,6 +14,7 @@ import os
 os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
 
 import sys
+import time
 import argparse
 import random
 from dataclasses import dataclass
@@ -72,7 +73,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache=None):
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -87,10 +88,17 @@ class CausalSelfAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # KV-cache: append new K/V to cached K/V from previous steps
+        if kv_cache is not None:
+            cached_k, cached_v = kv_cache
+            k = torch.cat([cached_k, k], dim=2)
+            v = torch.cat([cached_v, v], dim=2)
+        new_kv_cache = (k, v)
+        # When using cache, T_new=1 but K/V have full sequence — not causal masking needed
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=(kv_cache is None))
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
-        return y
+        return y, new_kv_cache
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -107,10 +115,11 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache=None):
+        attn_out, new_kv_cache = self.attn(norm(x), ve, cos_sin, window_size, kv_cache=kv_cache)
+        x = x + attn_out
         x = x + self.mlp(norm(x))
-        return x
+        return x, new_kv_cache
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -154,16 +163,21 @@ class GPT(nn.Module):
         sizes[-1] = (long_window, 0)
         return sizes
 
-    def forward(self, idx, targets=None, reduction='mean'):
+    def forward(self, idx, targets=None, reduction='mean', kv_caches=None, start_pos=0):
         B, T = idx.size()
-        cos_sin = self.cos[:, :T], self.sin[:, :T]
+        # For KV-cache: cos/sin must be offset to the correct positions
+        pos_end = start_pos + T
+        cos_sin = self.cos[:, start_pos:pos_end], self.sin[:, start_pos:pos_end]
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x
+        new_kv_caches = []
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            layer_cache = kv_caches[i] if kv_caches is not None else None
+            x, new_cache = block(x, ve, cos_sin, self.window_sizes[i], kv_cache=layer_cache)
+            new_kv_caches.append(new_cache)
         x = norm(x)
         softcap = 15
         logits = self.lm_head(x).float()
@@ -171,7 +185,7 @@ class GPT(nn.Module):
         if targets is not None:
             return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                    ignore_index=-1, reduction=reduction)
-        return logits
+        return logits, new_kv_caches
 
 # ---------------------------------------------------------------------------
 # Generation
@@ -261,9 +275,23 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
     for i in range(len(generated)):
         _update_ngram_counts(generated, i)
 
+    kv_caches = None
+    # Prefill: process the entire prompt at once
+    ctx = seq
+    logits, kv_caches = model(ctx, kv_caches=kv_caches, start_pos=0)
+    logits = logits[:, -1, :].float()
+    cur_pos = seq.size(1)
+
+    t0 = time.perf_counter()
+    last_report = t0
     for step in range(max_tokens):
-        ctx = seq if seq.size(1) <= MAX_SEQ_LEN else seq[:, -MAX_SEQ_LEN:]
-        logits = model(ctx)[:, -1, :].float()
+        # Live progress reporting
+        now = time.perf_counter()
+        if step > 0 and (step % 50 == 0 or now - last_report >= 2.0):
+            elapsed = now - t0
+            tok_s = step / elapsed if elapsed > 0 else 0
+            print(f"\r    {step} tokens | {bar_count} bars | {elapsed:.1f}s | {tok_s:.1f} tok/s", end="", flush=True)
+            last_report = now
 
         # --- Anti-repetition 1: Standard repetition penalty ---
         if repetition_penalty != 1.0:
@@ -332,6 +360,12 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
         _update_ngram_counts(generated, len(generated) - 1)
         seq = torch.cat([seq, next_tok], dim=1)
 
+        # Incremental forward pass: only process the new token with KV-cache
+        if tok_val != EOS:
+            logits, kv_caches = model(next_tok, kv_caches=kv_caches, start_pos=cur_pos)
+            logits = logits[:, -1, :].float()
+            cur_pos += 1
+
         if tok_val == EOS:
             break
         if tok_val == BAR:
@@ -342,6 +376,10 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
                 generated.append(EOS)
                 break
 
+    elapsed = time.perf_counter() - t0
+    n_generated = len(generated) - len(prompt_tokens)
+    tok_per_sec = n_generated / elapsed if elapsed > 0 else 0
+    print(f"\r    Generated {n_generated} tokens in {elapsed:.1f}s ({tok_per_sec:.1f} tok/s)          ")
     return seq.squeeze(0).tolist()
 
 
