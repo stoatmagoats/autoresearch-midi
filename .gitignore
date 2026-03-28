@@ -19,9 +19,8 @@ dev/
 results/
 results.tsv
 
-# Training artifacts — checkpoints and logs (large binary files)
+# Training artifacts — checkpoints (large binary files)
 runs/**/checkpoint.pt
-runs/**/run.log
 checkpoint.pt
 .midi_cache/
 
