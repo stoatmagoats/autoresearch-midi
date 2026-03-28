@@ -158,6 +158,7 @@ soundfont /usr/share/soundfonts/FluidR3_GM.sf2
 | `--presence-penalty` | 0.3 | Additive penalty for recently seen content tokens |
 | `--ngram-penalty` | 2.0 | Penalty for repeating n-gram patterns (0=off) |
 | `--motif-bonus` | 0.4 | Logit bonus for pitches from 2-8 bars ago (smart mode) |
+| `--dynamic-momentum` | 1.5 | Velocity momentum for coherent builds/releases (0=off) |
 
 ## AMD ROCm Specifics
 - **GPU**: AMD Radeon 8060S (gfx1151, RDNA 3.5, 96GB unified memory)

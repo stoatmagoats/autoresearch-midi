@@ -159,6 +159,8 @@
 
 9. **Smart repetition control produces richer output.** With motif-aware penalties (scale=0.3 normally, 3.0 during loops), Chopin pieces generate ~3.3× more tokens per piece (1935 vs 576 tokens for 32 bars) compared to aggressive flat penalties. The model fills bars with richer note content when not suppressed by heavy penalties. No degenerate loops detected (streak stays at 0).
 
+10. **Dynamic momentum smooths emotional arcs.** The model's 2048-token context window (~4-6 bars) prevents it from planning multi-bar dynamic arcs (build → climax → release). The `DynamicArcController` tracks velocity trends per bar and gently prevents abrupt jumps — a build can't suddenly collapse into silence. This is a generation-time band-aid; the root cause fix is Experiment 2.2 (longer context window).
+
 ---
 
 ## Next Steps
@@ -171,5 +173,6 @@ See **EXPERIMENTS.md** for the full phased experiment plan (9 experiments across
 - [x] Run 010: Extended training on augmented data (4hr, resumed from Run 008, val_bpb=0.849)
 - [x] KV-cache generation — ~150 tok/s with live progress output
 - [x] Experiment 1.3: Smarter repetition control — motif-aware penalties (smart/aggressive/off modes)
+- [x] Dynamic momentum — velocity arc guidance for coherent builds/releases
 - [ ] Experiment 2.1: Chord tokens (REMI+) for explicit harmony
-- [ ] Experiment 2.2: Longer context window (4096+)
+- [ ] Experiment 2.2: Longer context window (4096+) — root cause fix for structural coherence

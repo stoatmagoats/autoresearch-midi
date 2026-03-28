@@ -208,7 +208,7 @@ def load_model(checkpoint_path, device="cuda"):
 # ---------------------------------------------------------------------------
 
 from collections import defaultdict
-from prepare import is_pitch, is_dur, is_vel, dec_pitch
+from prepare import is_pitch, is_dur, is_vel, dec_pitch, dec_vel, tok_vel, NUM_VEL_BINS
 
 class MotifAwareRepetitionControl:
     """Hierarchical repetition controller that allows musical motif return
@@ -322,12 +322,115 @@ class MotifAwareRepetitionControl:
         return 0.0
 
 
+# ---------------------------------------------------------------------------
+# Dynamic Arc Controller — velocity momentum for coherent builds/releases
+# ---------------------------------------------------------------------------
+
+class DynamicArcController:
+    """Tracks velocity trends across bars and nudges generation toward coherent
+    dynamic arcs (builds → climaxes, releases → quiet sections).
+
+    Problem: The model generates good local dynamics but can abruptly switch
+    from a build to a quiet section because its 2048-token context window
+    can't see the full arc.
+
+    Solution: Track the velocity trend over the last N bars. If velocity is
+    rising (build), gently penalize sudden drops. If velocity is falling
+    (release), gently penalize sudden spikes. Allow gradual transitions.
+
+    The bias is soft — the model CAN change direction, but only gradually
+    over 2-3 bars rather than instantly.
+    """
+
+    def __init__(self, momentum_strength=1.5, trend_window=4, max_jump=10):
+        self.bar_avg_velocities = []  # average velocity bin per completed bar
+        self.current_bar_vels = []    # velocity bins in current (incomplete) bar
+        self.momentum_strength = momentum_strength
+        self.trend_window = trend_window
+        self.max_jump = max_jump  # max allowed velocity bin jump per bar
+
+    def on_token(self, tok_val):
+        """Call after each generated token."""
+        if is_vel(tok_val):
+            self.current_bar_vels.append(dec_vel(tok_val))
+        elif tok_val == BAR:
+            if self.current_bar_vels:
+                avg = sum(self.current_bar_vels) / len(self.current_bar_vels)
+                self.bar_avg_velocities.append(avg)
+            self.current_bar_vels = []
+
+    def get_velocity_bias(self):
+        """Returns dict of {vel_token_id: logit_bias} to apply.
+        Positive bias = boost, negative = penalize.
+        """
+        if len(self.bar_avg_velocities) < 2 or self.momentum_strength <= 0:
+            return {}
+
+        window = self.bar_avg_velocities[-self.trend_window:]
+        if len(window) < 2:
+            return {}
+
+        # Compute linear trend: positive = crescendo, negative = diminuendo
+        trend = (window[-1] - window[0]) / len(window)
+        recent_avg = window[-1]  # use most recent bar, not window average
+
+        biases = {}
+        for vel_bin in range(NUM_VEL_BINS):
+            tok_id = tok_vel(vel_bin)
+            distance_from_recent = vel_bin - recent_avg
+
+            if abs(trend) > 0.5:  # meaningful trend detected
+                if trend > 0:  # BUILDING — penalize sudden drops
+                    if distance_from_recent < -self.max_jump:
+                        # Big drop during a build — penalize proportionally
+                        overshoot = abs(distance_from_recent) - self.max_jump
+                        biases[tok_id] = -self.momentum_strength * (overshoot / NUM_VEL_BINS)
+                    elif distance_from_recent > 0:
+                        # Continuing the build — small boost
+                        biases[tok_id] = self.momentum_strength * 0.15
+                else:  # RELEASING — penalize sudden spikes
+                    if distance_from_recent > self.max_jump:
+                        # Big spike during a release — penalize proportionally
+                        overshoot = distance_from_recent - self.max_jump
+                        biases[tok_id] = -self.momentum_strength * (overshoot / NUM_VEL_BINS)
+                    elif distance_from_recent < 0:
+                        # Continuing the release — small boost
+                        biases[tok_id] = self.momentum_strength * 0.15
+            else:
+                # No strong trend — gently penalize extreme jumps in either direction
+                if abs(distance_from_recent) > self.max_jump:
+                    overshoot = abs(distance_from_recent) - self.max_jump
+                    biases[tok_id] = -self.momentum_strength * 0.3 * (overshoot / NUM_VEL_BINS)
+
+        return biases
+
+    @property
+    def trend_str(self):
+        """Human-readable trend for progress display."""
+        if len(self.bar_avg_velocities) < 2:
+            return ""
+        window = self.bar_avg_velocities[-self.trend_window:]
+        if len(window) < 2:
+            return ""
+        trend = (window[-1] - window[0]) / len(window)
+        if trend > 1.5:
+            return "↑build"
+        elif trend > 0.5:
+            return "↗rise"
+        elif trend < -1.5:
+            return "↓release"
+        elif trend < -0.5:
+            return "↘fade"
+        return "→steady"
+
+
 @torch.no_grad()
 def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
              temperature=0.95, top_k=50, top_p=0.95,
              repetition_penalty=1.2, presence_penalty=0.3,
              ngram_penalty=2.0, ngram_sizes=(3, 4, 5, 6, 8),
              repetition_mode="smart", motif_return_bonus=0.4,
+             dynamic_momentum=1.5,
              device="cuda"):
     """Generate tokens with motif-aware anti-repetition.
 
@@ -366,9 +469,14 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
     motif_ctrl = MotifAwareRepetitionControl(
         motif_return_bonus=motif_return_bonus,
     )
-    # Feed prompt tokens into motif controller
+    # Initialize dynamic arc controller
+    arc_ctrl = DynamicArcController(
+        momentum_strength=dynamic_momentum,
+    )
+    # Feed prompt tokens into controllers
     for t in prompt_tokens:
         motif_ctrl.on_token(t)
+        arc_ctrl.on_token(t)
 
     kv_caches = None
     ctx = seq
@@ -384,8 +492,11 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
         if step > 0 and (step % 50 == 0 or now - last_report >= 2.0):
             elapsed = now - t0
             tok_s = step / elapsed if elapsed > 0 else 0
-            streak_str = f" streak={motif_ctrl.consecutive_streak}" if repetition_mode == "smart" else ""
-            print(f"\r    {step} tokens | {bar_count} bars | {elapsed:.1f}s | {tok_s:.1f} tok/s{streak_str}", end="", flush=True)
+            extra = ""
+            if repetition_mode == "smart":
+                arc_info = arc_ctrl.trend_str
+                extra = f" {arc_info}" if arc_info else ""
+            print(f"\r    {step} tokens | {bar_count} bars | {elapsed:.1f}s | {tok_s:.1f} tok/s{extra}", end="", flush=True)
             last_report = now
 
         effective_temp = temperature
@@ -433,6 +544,13 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
             for tok_id, bonus in bonus_pitches.items():
                 if tok_id < logits.size(-1):
                     logits[0, tok_id] += bonus
+
+            # Dynamic arc guidance: velocity momentum
+            if dynamic_momentum > 0:
+                vel_biases = arc_ctrl.get_velocity_bias()
+                for tok_id, bias in vel_biases.items():
+                    if tok_id < logits.size(-1):
+                        logits[0, tok_id] += bias
 
             # Loop-breaking: temperature boost + BAR penalty
             effective_temp *= motif_ctrl.get_loop_temperature_multiplier()
@@ -515,6 +633,7 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
         _update_ngram_counts(generated, len(generated) - 1)
         if repetition_mode == "smart":
             motif_ctrl.on_token(tok_val)
+            arc_ctrl.on_token(tok_val)
         seq = torch.cat([seq, next_tok], dim=1)
 
         # Incremental forward pass: only process the new token with KV-cache
@@ -571,6 +690,8 @@ def main():
                              "aggressive (old flat penalties), off (no penalties)")
     parser.add_argument("--motif-bonus", type=float, default=0.4,
                         help="Logit bonus for pitches from bars heard 2-8 bars ago (default: 0.4)")
+    parser.add_argument("--dynamic-momentum", type=float, default=1.5,
+                        help="Velocity momentum strength for coherent builds/releases (0=off, default: 1.5)")
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--n", type=int, default=1)
     parser.add_argument("--seed", type=int, default=None)
@@ -667,6 +788,7 @@ def main():
                               ngram_penalty=args.ngram_penalty,
                               repetition_mode=args.repetition_mode,
                               motif_return_bonus=args.motif_bonus,
+                              dynamic_momentum=args.dynamic_momentum,
                               device=device)
 
         n_bars = sum(1 for t in tokens if t == BAR)
