@@ -28,5 +28,6 @@ checkpoint.pt
 midi_files/
 generated/
 
-# Triton compilation cache
+# Triton/Inductor compilation cache
 .triton/
+.inductor_cache/

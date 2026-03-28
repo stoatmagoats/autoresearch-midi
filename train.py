@@ -10,6 +10,11 @@ import signal
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL"] = "1"
+# Persist inductor cache (survives reboots, unlike /tmp/torchinductor_*)
+_cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".inductor_cache")
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = _cache_dir
+os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"  # cache FX graph for faster warmup
+os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = str(os.cpu_count())  # parallel kernel compilation
 
 import gc
 import math

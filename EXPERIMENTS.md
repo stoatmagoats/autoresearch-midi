@@ -1,7 +1,7 @@
 # Experiment Plans — MIDI Music Generation Quality
 
 > Phased experiment roadmap to improve motif coherence, harmonic quality, sectional structure, and emotional direction.
-> **Approved:** 2026-03-27 · **Current best:** Run 005, val_bpb=0.887
+> **Approved:** 2026-03-27 · **Current best:** Run 006, val_bpb=0.784
 
 ---
 
@@ -27,7 +27,7 @@
 
 ### Experiment 1.1 — Extended Training
 
-**Status:** ⬜ Not started
+**Status:** ✅ Done (Run 006: batch 64, TIME_BUDGET 7200s)
 **Hypothesis:** At 3 epochs the model hasn't saturated. More training deepens harmonic/structural learning.
 **Confidence:** High
 
@@ -76,7 +76,7 @@
 
 ### Experiment 1.2 — Transposition Augmentation
 
-**Status:** 🟡 In progress (tokenization complete, training next)
+**Status:** ✅ Done (Run 006: val_bpb 0.887 → 0.784, −11.6%)
 **Hypothesis:** Transposing each piece to all 12 keys teaches key-invariant harmony — the model learns interval relationships rather than absolute pitch memorization.
 **Confidence:** High
 

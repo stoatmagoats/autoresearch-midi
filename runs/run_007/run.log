@@ -1,0 +1,16 @@
+Logging to /home/jonathan/Documents/projects/autoresearch/runs/run_007/run.log
+Initial config written to /home/jonathan/Documents/projects/autoresearch/runs/run_007/config.json
+/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/amp/autocast_mode.py:270: UserWarning: User provided device_type of 'cuda', but CUDA is not available. Disabling
+  warnings.warn(
+Traceback (most recent call last):
+  File "/home/jonathan/Documents/projects/autoresearch/train.py", line 597, in <module>
+    PEAK_BF16_FLOPS = _detect_peak_flops()
+  File "/home/jonathan/Documents/projects/autoresearch/train.py", line 589, in _detect_peak_flops
+    gpu_name = torch.cuda.get_device_name(0)
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/cuda/__init__.py", line 582, in get_device_name
+    return get_device_properties(device).name
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/cuda/__init__.py", line 614, in get_device_properties
+    _lazy_init()  # will define _get_device_properties
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/cuda/__init__.py", line 410, in _lazy_init
+    torch._C._cuda_init()
+RuntimeError: Found no NVIDIA driver on your system. Please check that you have an NVIDIA GPU and installed a driver from http://www.nvidia.com/Download/index.aspx

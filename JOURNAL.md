@@ -133,7 +133,8 @@
 | 002 | 12 | 49.2M | 292 files (2.9M tok) | 1h | 131K | 38 | 4.195 | ⚠️ Overfitted |
 | 003 | 8 | 14.9M | 3,188 files (43.7M tok) | 1h | 65K | 6 | 0.889 | Data scaling win |
 | 004 | 12 | 49.3M | 3,188 files (43.7M tok) | 1h | 197K | 3 | 1.021 | Undercooked |
-| 005 | 12 | 49.3M | 3,188 files (43.7M tok) | 1h | 197K | 3 | **0.887** | ✅ Current best |
+| 005 | 12 | 49.3M | 3,188 files (43.7M tok) | 1h | 197K | 3 | **0.887** | Extended training |
+| 006 | 12 | 49.3M | 25,829 seqs (377M tok) | 2h | 131K | 0.5 | **0.784** | ✅ Transposition aug |
 
 ---
 
@@ -147,7 +148,9 @@
 
 4. **Resumption / warm-starting helps.** Run 005 matched the 8-layer model at 0.887 bpb, likely because it benefited from a better initialization or data ordering vs. run 004.
 
-5. **VRAM headroom exists.** 78.6 GB of 96 GB used — ~18 GB remaining. Could push batch size higher or try an even larger model if data supports it.
+5. **Transposition augmentation is a massive win.** Run 006 dropped bpb from 0.887 → 0.784 (−11.6%) — the biggest single improvement so far. Each piece transposed to 11 keys (−5..+6 semitones). The model only saw ~50% of the augmented data in 2 hours (1 epoch), so more training should help further.
+
+6. **Smaller batch = more steps/hr.** Reducing batch from 96→64 gave 1,446 steps (vs 494 at batch 96) — 2.9× more gradient updates, dropping VRAM from 78.6→52.6 GB.
 
 ---
 
@@ -156,7 +159,8 @@
 See **EXPERIMENTS.md** for the full phased experiment plan (9 experiments across 3 phases).
 
 **Immediate priorities:**
-- [ ] Experiment 1.1: Extended training — resume Run 005 for 2-4 hours with batch size 64
-- [ ] Experiment 1.2: Transposition augmentation — 10× more data via pitch shifting
+- [x] Experiment 1.1: Extended training — resume Run 005 for 2-4 hours with batch size 64
+- [x] Experiment 1.2: Transposition augmentation — 10× more data via pitch shifting
+- [ ] Run 007/008: Extended training on augmented data (resume Run 006 with torch.compile)
 - [ ] Experiment 1.3: Smarter repetition control — motif-aware penalties in generate.py
 

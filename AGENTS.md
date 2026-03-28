@@ -69,13 +69,23 @@ uv pip install --no-cache-dir \
 uv run python prepare.py
 ```
 
-### Training (~1 hour)
+### Training (~2 hours)
+
+**Important:** Use `.venv/bin/python` instead of `uv run` — `uv run` can overwrite the ROCm PyTorch with the CUDA version.
+
 ```bash
 # Train the model (auto-creates runs/run_NNN/ with checkpoint, config, log)
-uv run python train.py
+.venv/bin/python train.py
 
 # Resume training from a previous run
-RESUME_RUN=5 uv run python train.py
+RESUME_RUN=6 .venv/bin/python train.py
+
+# Detachable training (survives SSH disconnect):
+tmux new -s train '.venv/bin/python train.py'
+# Detach: Ctrl+B then D
+# Reattach: tmux attach -t train
+
+# Pause training: Ctrl+C (saves checkpoint, prints resume command)
 
 # Check results
 grep "^val_bpb:\|^peak_vram_mb:" runs/run_NNN/run.log
