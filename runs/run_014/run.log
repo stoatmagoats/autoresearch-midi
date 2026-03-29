@@ -1,0 +1,19 @@
+Logging to /home/jonathan/Documents/projects/autoresearch/runs/run_014/run.log
+Initial config written to /home/jonathan/Documents/projects/autoresearch/runs/run_014/config.json
+Detected GPU: Radeon 8060S Graphics -> peak BF16 FLOPS: 1.4e+14
+Vocab size: 402
+Model config: {'sequence_len': 8192, 'vocab_size': 402, 'n_layer': 12, 'n_head': 9, 'n_kv_head': 9, 'n_embd': 576, 'window_pattern': 'SSSL'}
+Parameter counts:
+  wte                     : 231,552
+  value_embeds            : 1,389,312
+  lm_head                 : 231,552
+  transformer_matrices    : 47,777,472
+  scalars                 : 24
+  total                   : 49,629,912
+Estimated FLOPs per token: 7.127274e+08
+Scaling AdamW LRs by 1/sqrt(576/768) = 1.154701
+ROCm: patched InductorBenchmarker (ZeroDivisionError fix)
+torch.compile: enabled
+Time budget: 57600s
+Gradient accumulation steps: 1
+step 00000 (0.0%) | loss: 5.996261 | lrm: 1.00 | dt: 889581ms | tok/sec: 442 | mfu: 0.2% | epoch: 1 | remaining: 57600s    step 00001 (0.0%) | loss: 6.382053 | lrm: 1.00 | dt: 26125ms | tok/sec: 15,051 | mfu: 7.7% | epoch: 1 | remaining: 57600s    step 00002 (0.0%) | loss: 5.779204 | lrm: 1.00 | dt: 26140ms | tok/sec: 15,042 | mfu: 7.7% | epoch: 1 | remaining: 57600s    step 00003 (0.0%) | loss: 5.055492 | lrm: 1.00 | dt: 26084ms | tok/sec: 15,075 | mfu: 7.7% | epoch: 1 | remaining: 57600s    step 00004 (0.0%) | loss: 4.539800 | lrm: 1.00 | dt: 26130ms | tok/sec: 15,048 | mfu: 7.7% | epoch: 1 | remaining: 57600s    step 00005 (0.0%) | loss: 4.196918 | lrm: 1.00 | dt: 26116ms | tok/sec: 15,056 | mfu: 7.7% | epoch: 1 | remaining: 57600s    step 00006 (0.0%) | loss: 3.954454 | lrm: 1.00 | dt: 26111ms | tok/sec: 15,059 | mfu: 7.7% | epoch: 1 | remaining: 57600s    step 00007 (0.0%) | loss: 3.780976 | lrm: 1.00 | dt: 26118ms | tok/sec: 15,055 | mfu: 7.7% | epoch: 1 | remaining: 57600s    step 00008 (0.0%) | loss: 3.649364 | lrm: 1.00 | dt: 26091ms | tok/sec: 15,070 | mfu: 7.7% | epoch: 1 | remaining: 57600s    step 00009 (0.0%) | loss: 3.528057 | lrm: 1.00 | dt: 26111ms | tok/sec: 15,059 | mfu: 7.7% | epoch: 1 | remaining: 57600s    

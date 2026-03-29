@@ -31,3 +31,4 @@ generated/
 # Triton/Inductor compilation cache
 .triton/
 .inductor_cache/
+*.whl

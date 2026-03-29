@@ -1,0 +1,43 @@
+Logging to /home/jonathan/Documents/projects/autoresearch/runs/run_011/run.log
+Initial config written to /home/jonathan/Documents/projects/autoresearch/runs/run_011/config.json
+Detected GPU: Radeon 8060S Graphics -> peak BF16 FLOPS: 1.4e+14
+Vocab size: 402
+Model config: {'sequence_len': 8192, 'vocab_size': 402, 'n_layer': 12, 'n_head': 9, 'n_kv_head': 9, 'n_embd': 576, 'window_pattern': 'SSSL'}
+Traceback (most recent call last):
+  File "/home/jonathan/Documents/projects/autoresearch/train.py", line 622, in <module>
+    model = GPT(config)
+  File "/home/jonathan/Documents/projects/autoresearch/train.py", line 149, in __init__
+    "wte": nn.Embedding(config.vocab_size, config.n_embd),
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/nn/modules/sparse.py", line 172, in __init__
+    self.reset_parameters()
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/nn/modules/sparse.py", line 183, in reset_parameters
+    init.normal_(self.weight)
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/nn/init.py", line 261, in normal_
+    return torch.overrides.handle_torch_function(
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/overrides.py", line 1728, in handle_torch_function
+    result = mode.__torch_function__(public_api, types, args, kwargs)
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/utils/_device.py", line 103, in __torch_function__
+    return func(*args, **kwargs)
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/nn/init.py", line 264, in normal_
+    return _no_grad_normal_(tensor, mean, std, generator)
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/nn/init.py", line 82, in _no_grad_normal_
+    return tensor.normal_(mean, std, generator=generator)
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/_refs/__init__.py", line 6328, in normal_
+    return normal(mean, std, self.shape, out=self, generator=generator)
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/_prims_common/wrappers.py", line 309, in _fn
+    result = fn(*args, **kwargs)
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/_compile.py", line 46, in inner
+    import torch._dynamo
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/_dynamo/__init__.py", line 13, in <module>
+    from . import (
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/_dynamo/aot_compile.py", line 15, in <module>
+    from . import convert_frame
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/_dynamo/convert_frame.py", line 57, in <module>
+    from torch._dynamo.symbolic_convert import TensorifyState
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/_dynamo/symbolic_convert.py", line 53, in <module>
+    from torch._dynamo.exc import ObservedException, TensorifyScalarRestartAnalysis
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/_dynamo/exc.py", line 45, in <module>
+    from .utils import counters
+  File "/home/jonathan/Documents/projects/autoresearch/.venv/lib/python3.10/site-packages/torch/_dynamo/utils.py", line 2417, in <module>
+    common_constant_types.add(triton.language.dtype)
+AttributeError: module 'triton' has no attribute 'language'

@@ -23,8 +23,8 @@ import torch
 # Constants (shared with train.py)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048
-TIME_BUDGET = 7200         # 2 hours for MIDI training (10× augmented dataset)
+MAX_SEQ_LEN = 8192
+TIME_BUDGET = 57600        # 16 hours for MIDI training (10× augmented dataset)
 MIDI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "midi_files")
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".midi_cache")
 
@@ -44,6 +44,10 @@ SPLIT_SEED = 42
 # Token Vocabulary
 # ---------------------------------------------------------------------------
 
+# Chord vocabulary: 12 roots × 5 qualities = 60 tokens + 1 "no chord"
+CHORD_QUALITIES = ['maj', 'min', 'dim', 'aug', 'dom7']
+NUM_CHORD_TOKENS = 12 * len(CHORD_QUALITIES) + 1  # 61
+
 PAD, BOS, EOS, BAR = 0, 1, 2, 3
 NUM_SPECIAL = 4
 
@@ -61,7 +65,8 @@ def _get_composers():
                   if os.path.isdir(os.path.join(MIDI_DIR, d)))
 
 COMPOSERS = _get_composers()
-VOCAB_SIZE = COMP_OFF + len(COMPOSERS)
+CHORD_OFF = COMP_OFF + len(COMPOSERS)
+VOCAB_SIZE = CHORD_OFF + NUM_CHORD_TOKENS
 
 # --- Encoding helpers ---
 def tok_pos(p):   return POS_OFF   + min(max(p, 0), MAX_POS_PER_BAR - 1)
@@ -70,6 +75,8 @@ def tok_dur(d):   return DUR_OFF   + min(max(d, 1), MAX_DUR_STEPS) - 1
 def tok_vel(v):   return VEL_OFF   + min(max(v, 0), NUM_VEL_BINS - 1)
 def tok_tempo(t): return TEMPO_OFF + min(max(t, 0), NUM_TEMPO_BINS - 1)
 def tok_comp(i):  return COMP_OFF  + i
+def tok_chord(root, qual_idx): return CHORD_OFF + root * len(CHORD_QUALITIES) + qual_idx
+def tok_chord_none():          return CHORD_OFF + 60
 
 # --- Decoding helpers ---
 def dec_pos(t):   return t - POS_OFF
@@ -78,6 +85,7 @@ def dec_dur(t):   return (t - DUR_OFF) + 1        # 1-indexed
 def dec_vel(t):   return t - VEL_OFF
 def dec_tempo(t): return t - TEMPO_OFF
 def dec_comp(t):  return t - COMP_OFF
+def dec_chord(t): return t - CHORD_OFF
 
 def is_pos(t):   return POS_OFF   <= t < POS_OFF   + MAX_POS_PER_BAR
 def is_pitch(t): return PITCH_OFF <= t < PITCH_OFF + 128
@@ -85,6 +93,7 @@ def is_dur(t):   return DUR_OFF   <= t < DUR_OFF   + MAX_DUR_STEPS
 def is_vel(t):   return VEL_OFF   <= t < VEL_OFF   + NUM_VEL_BINS
 def is_tempo(t): return TEMPO_OFF <= t < TEMPO_OFF + NUM_TEMPO_BINS
 def is_comp(t):  return COMP_OFF  <= t < COMP_OFF  + len(COMPOSERS)
+def is_chord(t): return CHORD_OFF <= t < CHORD_OFF + NUM_CHORD_TOKENS
 
 # --- Velocity / tempo quantization ---
 def vel_to_bin(v):   return min(v * NUM_VEL_BINS // 128, NUM_VEL_BINS - 1)
@@ -99,6 +108,37 @@ def bin_to_bpm(b):
 # ---------------------------------------------------------------------------
 # MIDI Parsing → tokens
 # ---------------------------------------------------------------------------
+
+def detect_chord(pitches):
+    """Given a list of MIDI pitches, detect the most likely chord.
+    Returns (root_pc, quality_idx) or None."""
+    if len(pitches) < 2:
+        return None
+    # Pitch class histogram
+    pc_hist = [0] * 12
+    for p in pitches:
+        pc_hist[p % 12] += 1
+    # Template matching against chord templates
+    templates = {
+        'maj': [1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0],  # root, M3, P5
+        'min': [1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0],  # root, m3, P5
+        'dim': [1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0],  # root, m3, d5
+        'aug': [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],  # root, M3, A5
+        'dom7': [1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0], # root, M3, P5, m7
+    }
+    best_score, best_root, best_qual = -1, 0, 0
+    for root in range(12):
+        for qi, (qname, template) in enumerate(templates.items()):
+            # Rotate template to this root
+            rotated = template[-root:] + template[:-root]
+            score = sum(a * b for a, b in zip(pc_hist, rotated))
+            if score > best_score:
+                best_score = score
+                best_root = root
+                best_qual = qi
+    return (best_root, best_qual) if best_score >= 2 else None
+
+# Piano range for transposition filtering
 
 # Piano range for transposition filtering
 PIANO_MIN, PIANO_MAX = 21, 108  # A0 to C8
@@ -169,13 +209,27 @@ def _tokenize_from_notes(notes, tpb, bpm, ts_num, ts_den, composer_idx):
     qnotes.sort(key=lambda x: (x[0], x[1], x[2]))
 
     # Build tokens
-    tokens = [BOS, tok_comp(composer_idx), tok_tempo(bpm_to_bin(bpm))]
-    cur_bar = -1
+    from collections import defaultdict
+    bars = defaultdict(list)
     for bar, pos, pit, dur, vb in qnotes:
-        while cur_bar < bar:
-            tokens.append(BAR)
-            cur_bar += 1
-        tokens.extend([tok_pos(pos), tok_pitch(pit), tok_dur(dur), tok_vel(vb)])
+        bars[bar].append((pos, pit, dur, vb))
+
+    tokens = [BOS, tok_comp(composer_idx), tok_tempo(bpm_to_bin(bpm))]
+    for bar_num in sorted(bars.keys()):
+        tokens.append(BAR)
+        
+        # Detect chord for this bar
+        bar_pitches = [pit for _, pit, _, _ in bars[bar_num]]
+        chord = detect_chord(bar_pitches)
+        if chord:
+            root, qual = chord
+            tokens.append(tok_chord(root, qual))
+        else:
+            tokens.append(tok_chord_none())
+            
+        # Add notes
+        for pos, pit, dur, vb in sorted(bars[bar_num]):
+            tokens.extend([tok_pos(pos), tok_pitch(pit), tok_dur(dur), tok_vel(vb)])
     tokens.append(EOS)
     return tokens
 
@@ -203,7 +257,7 @@ def tokens_to_midi(tokens, output_path=None, default_bpm=120):
     i = 0
     while i < len(tokens):
         t = tokens[i]
-        if t in (BOS, EOS, PAD) or is_comp(t):
+        if t in (BOS, EOS, PAD) or is_comp(t) or is_chord(t):
             i += 1; continue
         if is_tempo(t):
             bpm = bin_to_bpm(dec_tempo(t)); i += 1; continue

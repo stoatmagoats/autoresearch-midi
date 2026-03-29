@@ -38,7 +38,7 @@ IS_ROCM = hasattr(torch.version, 'hip') and torch.version.hip is not None
 
 @dataclass
 class GPTConfig:
-    sequence_len: int = 2048
+    sequence_len: int = 8192
     vocab_size: int = 32768
     n_layer: int = 12
     n_head: int = 6
@@ -73,7 +73,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache=None):
+    def forward(self, x, ve, cos_sin, window_size, layer_cache=None, start_pos=0):
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -89,16 +89,17 @@ class CausalSelfAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         # KV-cache: append new K/V to cached K/V from previous steps
-        if kv_cache is not None:
-            cached_k, cached_v = kv_cache
-            k = torch.cat([cached_k, k], dim=2)
-            v = torch.cat([cached_v, v], dim=2)
-        new_kv_cache = (k, v)
+        if layer_cache is not None:
+            cached_k, cached_v = layer_cache
+            cached_k[:, :, start_pos:start_pos+T, :] = k
+            cached_v[:, :, start_pos:start_pos+T, :] = v
+            k = cached_k[:, :, :start_pos+T, :]
+            v = cached_v[:, :, :start_pos+T, :]
         # When using cache, T_new=1 but K/V have full sequence — not causal masking needed
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=(kv_cache is None))
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=(layer_cache is None))
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
         y = self.c_proj(y)
-        return y, new_kv_cache
+        return y
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -115,11 +116,11 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
-    def forward(self, x, ve, cos_sin, window_size, kv_cache=None):
-        attn_out, new_kv_cache = self.attn(norm(x), ve, cos_sin, window_size, kv_cache=kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, layer_cache=None, start_pos=0):
+        attn_out = self.attn(norm(x), ve, cos_sin, window_size, layer_cache=layer_cache, start_pos=start_pos)
         x = x + attn_out
         x = x + self.mlp(norm(x))
-        return x, new_kv_cache
+        return x
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -171,13 +172,11 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x
-        new_kv_caches = []
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             layer_cache = kv_caches[i] if kv_caches is not None else None
-            x, new_cache = block(x, ve, cos_sin, self.window_sizes[i], kv_cache=layer_cache)
-            new_kv_caches.append(new_cache)
+            x = block(x, ve, cos_sin, self.window_sizes[i], layer_cache=layer_cache, start_pos=start_pos)
         x = norm(x)
         softcap = 15
         logits = self.lm_head(x).float()
@@ -185,7 +184,7 @@ class GPT(nn.Module):
         if targets is not None:
             return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
                                    ignore_index=-1, reduction=reduction)
-        return logits, new_kv_caches
+        return logits
 
 # ---------------------------------------------------------------------------
 # Generation
@@ -425,7 +424,7 @@ class DynamicArcController:
 
 
 @torch.no_grad()
-def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
+def generate(model, prompt_tokens, max_tokens=8192, max_bars=None,
              temperature=0.95, top_k=50, top_p=0.95,
              repetition_penalty=1.2, presence_penalty=0.3,
              ngram_penalty=2.0, ngram_sizes=(3, 4, 5, 6, 8),
@@ -478,9 +477,14 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
         motif_ctrl.on_token(t)
         arc_ctrl.on_token(t)
 
-    kv_caches = None
+    head_dim = model.config.n_embd // model.config.n_head
+    kv_caches = [
+        (torch.empty(1, model.config.n_kv_head, max_tokens + len(prompt_tokens), head_dim, dtype=torch.bfloat16, device=device),
+         torch.empty(1, model.config.n_kv_head, max_tokens + len(prompt_tokens), head_dim, dtype=torch.bfloat16, device=device))
+        for _ in range(model.config.n_layer)
+    ]
     ctx = seq
-    logits, kv_caches = model(ctx, kv_caches=kv_caches, start_pos=0)
+    logits = model(ctx, kv_caches=kv_caches, start_pos=0)
     logits = logits[:, -1, :].float()
     cur_pos = seq.size(1)
 
@@ -510,21 +514,21 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
                 # Effective penalty: lerp between 1.0 (no penalty) and full penalty
                 eff_rep = 1.0 + (repetition_penalty - 1.0) * scale
                 seen_tokens = set(generated[-512:] if len(generated) > 512 else generated)
-                for tok_id in seen_tokens:
-                    if tok_id < logits.size(-1) and _is_content_token(tok_id):
-                        if logits[0, tok_id] > 0:
-                            logits[0, tok_id] /= eff_rep
-                        else:
-                            logits[0, tok_id] *= eff_rep
+                seen_ids = [t for t in seen_tokens if t < logits.size(-1) and _is_content_token(t)]
+                if seen_ids:
+                    seen_tensor = torch.tensor(seen_ids, dtype=torch.long, device=device)
+                    pos_mask = logits[0, seen_tensor] > 0
+                    logits[0, seen_tensor[pos_mask]] /= eff_rep
+                    logits[0, seen_tensor[~pos_mask]] *= eff_rep
 
             # Scaled presence penalty
             if presence_penalty > 0:
                 eff_pres = presence_penalty * scale
                 recent_window = generated[-256:] if len(generated) > 256 else generated
-                recent_set = set(recent_window)
-                for tok_id in recent_set:
-                    if tok_id < logits.size(-1) and _is_content_token(tok_id):
-                        logits[0, tok_id] -= eff_pres
+                recent_ids = [t for t in set(recent_window) if t < logits.size(-1) and _is_content_token(t)]
+                if recent_ids:
+                    recent_tensor = torch.tensor(recent_ids, dtype=torch.long, device=device)
+                    logits[0, recent_tensor] -= eff_pres
 
             # Scaled n-gram penalty
             if ngram_penalty > 0:
@@ -534,23 +538,37 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
                         prefix = tuple(generated[-(n - 1):])
                         token_counts = ngram_by_prefix.get((n, prefix))
                         if token_counts:
+                            toks = []
+                            pens = []
                             for tok_id, count in token_counts.items():
                                 if tok_id < logits.size(-1):
-                                    penalty = eff_ngram * count * (n / 4.0)
-                                    logits[0, tok_id] -= penalty
+                                    toks.append(tok_id)
+                                    pens.append(eff_ngram * count * (n / 4.0))
+                            if toks:
+                                tok_tensor = torch.tensor(toks, dtype=torch.long, device=device)
+                                pen_tensor = torch.tensor(pens, dtype=torch.float32, device=device)
+                                logits[0, tok_tensor] -= pen_tensor
 
             # Motif return bonus: boost pitches from bars heard 2-8 bars ago
             bonus_pitches = motif_ctrl.get_motif_return_bonus_pitches()
-            for tok_id, bonus in bonus_pitches.items():
-                if tok_id < logits.size(-1):
-                    logits[0, tok_id] += bonus
+            if bonus_pitches:
+                toks = [t for t in bonus_pitches.keys() if t < logits.size(-1)]
+                bonuses = [bonus_pitches[t] for t in toks]
+                if toks:
+                    tok_tensor = torch.tensor(toks, dtype=torch.long, device=device)
+                    bonus_tensor = torch.tensor(bonuses, dtype=torch.float32, device=device)
+                    logits[0, tok_tensor] += bonus_tensor
 
             # Dynamic arc guidance: velocity momentum
             if dynamic_momentum > 0:
                 vel_biases = arc_ctrl.get_velocity_bias()
-                for tok_id, bias in vel_biases.items():
-                    if tok_id < logits.size(-1):
-                        logits[0, tok_id] += bias
+                if vel_biases:
+                    toks = [t for t in vel_biases.keys() if t < logits.size(-1)]
+                    biases = [vel_biases[t] for t in toks]
+                    if toks:
+                        tok_tensor = torch.tensor(toks, dtype=torch.long, device=device)
+                        bias_tensor = torch.tensor(biases, dtype=torch.float32, device=device)
+                        logits[0, tok_tensor] += bias_tensor
 
             # Loop-breaking: temperature boost + BAR penalty
             effective_temp *= motif_ctrl.get_loop_temperature_multiplier()
@@ -562,19 +580,19 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
             # --- AGGRESSIVE MODE: original flat penalties (old behavior) ---
             if repetition_penalty != 1.0:
                 seen_tokens = set(generated)
-                for tok_id in seen_tokens:
-                    if tok_id < logits.size(-1) and _is_content_token(tok_id):
-                        if logits[0, tok_id] > 0:
-                            logits[0, tok_id] /= repetition_penalty
-                        else:
-                            logits[0, tok_id] *= repetition_penalty
+                seen_ids = [t for t in seen_tokens if t < logits.size(-1) and _is_content_token(t)]
+                if seen_ids:
+                    seen_tensor = torch.tensor(seen_ids, dtype=torch.long, device=device)
+                    pos_mask = logits[0, seen_tensor] > 0
+                    logits[0, seen_tensor[pos_mask]] /= repetition_penalty
+                    logits[0, seen_tensor[~pos_mask]] *= repetition_penalty
 
             if presence_penalty > 0:
                 recent_window = generated[-256:] if len(generated) > 256 else generated
-                recent_set = set(recent_window)
-                for tok_id in recent_set:
-                    if tok_id < logits.size(-1) and _is_content_token(tok_id):
-                        logits[0, tok_id] -= presence_penalty
+                recent_ids = [t for t in set(recent_window) if t < logits.size(-1) and _is_content_token(t)]
+                if recent_ids:
+                    recent_tensor = torch.tensor(recent_ids, dtype=torch.long, device=device)
+                    logits[0, recent_tensor] -= presence_penalty
 
             if ngram_penalty > 0:
                 for n in ngram_sizes:
@@ -582,10 +600,16 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
                         prefix = tuple(generated[-(n - 1):])
                         token_counts = ngram_by_prefix.get((n, prefix))
                         if token_counts:
+                            toks = []
+                            pens = []
                             for tok_id, count in token_counts.items():
                                 if tok_id < logits.size(-1):
-                                    penalty = ngram_penalty * count * (n / 4.0)
-                                    logits[0, tok_id] -= penalty
+                                    toks.append(tok_id)
+                                    pens.append(ngram_penalty * count * (n / 4.0))
+                            if toks:
+                                tok_tensor = torch.tensor(toks, dtype=torch.long, device=device)
+                                pen_tensor = torch.tensor(pens, dtype=torch.float32, device=device)
+                                logits[0, tok_tensor] -= pen_tensor
 
             # Bar-level streak detection (old behavior)
             def _get_bars_from(tokens):
@@ -638,7 +662,7 @@ def generate(model, prompt_tokens, max_tokens=4096, max_bars=None,
 
         # Incremental forward pass: only process the new token with KV-cache
         if tok_val != EOS:
-            logits, kv_caches = model(next_tok, kv_caches=kv_caches, start_pos=cur_pos)
+            logits = model(next_tok, kv_caches=kv_caches, start_pos=cur_pos)
             logits = logits[:, -1, :].float()
             cur_pos += 1
 
@@ -671,8 +695,8 @@ def main():
     parser.add_argument("--composer", type=str, default=None,
                         help=f"Available: {', '.join(COMPOSERS)}")
     parser.add_argument("--tempo", type=int, default=120)
-    parser.add_argument("--max-tokens", type=int, default=4096,
-                        help="Maximum tokens to generate (default: 4096)")
+    parser.add_argument("--max-tokens", type=int, default=8192,
+                        help="Maximum tokens to generate (default: 8192)")
     parser.add_argument("--bars", type=int, default=None,
                         help="Stop after N bars (e.g. --bars 32 for ~30s at 120 BPM)")
     parser.add_argument("--temperature", type=float, default=0.95)

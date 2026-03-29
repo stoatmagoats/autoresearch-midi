@@ -137,8 +137,8 @@ soundfont /usr/share/soundfonts/FluidR3_GM.sf2
 | `DEPTH` | 12 | Number of transformer layers |
 | `ASPECT_RATIO` | 48 | `model_dim = DEPTH * ASPECT_RATIO` |
 | `HEAD_DIM` | 64 | Head dimension (9 heads at 576-dim) |
-| `DEVICE_BATCH_SIZE` | 64 | Per-device batch size |
-| `TOTAL_BATCH_SIZE` | 131072 | Tokens per optimizer step (64×2048) |
+| `DEVICE_BATCH_SIZE` | 16 | Per-device batch size |
+| `TOTAL_BATCH_SIZE` | 131072 | Tokens per optimizer step (16×8192) |
 | `TIME_BUDGET` | 7200 | Training time in seconds (2 hours) |
 | `MATRIX_LR` | 0.04 | Learning rate for Muon params |
 | `WARMDOWN_RATIO` | 0.5 | Fraction of budget for LR cooldown |
@@ -167,8 +167,8 @@ soundfont /usr/share/soundfonts/FluidR3_GM.sf2
 - **ROCm SDK**: 7.2.0 (system-level, via `pacman -S rocm-hip-sdk`)
 - **Attention**: PyTorch SDPA with experimental AOTriton (`TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1`)
 - **torch.compile**: Enabled with monkey-patch (fixes ZeroDivisionError in InductorBenchmarker, ~1.2× speedup)
-- **Generation**: KV-cache enabled (~150 tok/s), with live progress output
-- Peak VRAM: ~35 GB (training, batch 64)
+- **Generation**: $O(N)$ pre-allocated KV-cache enabled with fully-vectorized penalties (~150+ tok/s).
+- Peak VRAM: ~85 GB (training, batch 16 at 8192 sequence length without checkpointing)
 
 ## Metric
 

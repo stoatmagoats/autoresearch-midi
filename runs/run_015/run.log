@@ -1,0 +1,19 @@
+Logging to /home/jonathan/Documents/projects/autoresearch/runs/run_015/run.log
+Initial config written to /home/jonathan/Documents/projects/autoresearch/runs/run_015/config.json
+Detected GPU: Radeon 8060S Graphics -> peak BF16 FLOPS: 1.4e+14
+Vocab size: 402
+Model config: {'sequence_len': 8192, 'vocab_size': 402, 'n_layer': 12, 'n_head': 9, 'n_kv_head': 9, 'n_embd': 576, 'window_pattern': 'SSSL'}
+Parameter counts:
+  wte                     : 231,552
+  value_embeds            : 1,389,312
+  lm_head                 : 231,552
+  transformer_matrices    : 47,777,472
+  scalars                 : 24
+  total                   : 49,629,912
+Estimated FLOPs per token: 7.127274e+08
+Scaling AdamW LRs by 1/sqrt(576/768) = 1.154701
+ROCm: patched InductorBenchmarker (ZeroDivisionError fix)
+torch.compile: enabled
+Time budget: 57600s
+Gradient accumulation steps: 1
+step 00000 (0.0%) | loss: 5.995848 | lrm: 1.00 | dt: 10662ms | tok/sec: 18,440 | mfu: 9.4% | epoch: 1 | remaining: 57600s    step 00001 (0.0%) | loss: 5.725275 | lrm: 1.00 | dt: 9654ms | tok/sec: 20,366 | mfu: 10.4% | epoch: 1 | remaining: 57600s    step 00002 (0.0%) | loss: 5.015156 | lrm: 1.00 | dt: 9716ms | tok/sec: 20,235 | mfu: 10.4% | epoch: 1 | remaining: 57600s    step 00003 (0.0%) | loss: 4.445014 | lrm: 1.00 | dt: 9712ms | tok/sec: 20,244 | mfu: 10.4% | epoch: 1 | remaining: 57600s    step 00004 (0.0%) | loss: 4.153136 | lrm: 1.00 | dt: 9714ms | tok/sec: 20,240 | mfu: 10.4% | epoch: 1 | remaining: 57600s    step 00005 (0.0%) | loss: 3.889036 | lrm: 1.00 | dt: 9705ms | tok/sec: 20,257 | mfu: 10.4% | epoch: 1 | remaining: 57600s    step 00006 (0.0%) | loss: 3.718182 | lrm: 1.00 | dt: 9696ms | tok/sec: 20,277 | mfu: 10.4% | epoch: 1 | remaining: 57600s    step 00007 (0.0%) | loss: 3.576837 | lrm: 1.00 | dt: 9704ms | tok/sec: 20,259 | mfu: 10.4% | epoch: 1 | remaining: 57600s    step 00008 (0.0%) | loss: 3.459980 | lrm: 1.00 | dt: 9747ms | tok/sec: 20,170 | mfu: 10.3% | epoch: 1 | remaining: 57600s    step 00009 (0.0%) | loss: 3.367141 | lrm: 1.00 | dt: 9698ms | tok/sec: 20,273 | mfu: 10.4% | epoch: 1 | remaining: 57600s    step 00010 (0.0%) | loss: 3.299667 | lrm: 1.00 | dt: 9731ms | tok/sec: 20,203 | mfu: 10.3% | epoch: 1 | remaining: 57600s    step 00011 (0.0%) | loss: 3.224311 | lrm: 1.00 | dt: 9710ms | tok/sec: 20,248 | mfu: 10.4% | epoch: 1 | remaining: 57590s    

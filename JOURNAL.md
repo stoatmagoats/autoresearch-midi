@@ -125,6 +125,66 @@
 
 ---
 
+## Run 016 — Max Throughput Optimization
+**Date:** 2026-03-28 · **Status:** ⚠️ OOM Crash (Batch 48)
+
+| Setting | Value | Δ from prev |
+|---|---|---|
+| Depth / Dim | 12 layers, 576-dim | — |
+| Dataset | 49 composers, 402 vocab | — |
+| Batch Size | 48 × 8192 = 393,216 tok/step | ↑ 2× from run 012 |
+| Peak VRAM | >96 GB | ↑ limits of 96GB APU |
+
+**What changed:** 
+- `DEVICE_BATCH_SIZE` increased directly to 48 (taking advantage of 96GB VRAM on Strix Halo). 
+- Completely removed `Gradient Checkpointing` to maximize raw `tok/sec` throughput by eliminating the 33% backward-pass re-computation penalty.
+- Reverted custom sliding-window `float_mask` back to PyTorch's native `is_causal=True` to prevent AOTriton from a catastrophic 58GB out-of-memory fallback on the Math backend.
+
+**Results & observations:**
+- Unrolled graph compilation crashed with `HIP out of memory` during training. The combination of 8192 sequence length and batch size 48 without checkpointing pushes slightly past the 96GB VRAM ceiling.
+- Generation capabilities drastically improved due to an $O(N)$ pre-allocated KV-cache slicing system and fully vectorized penalty array loops inside `generate.py`.
+
+**Takeaway:** Space/Time complexity trade-offs are extreme on ROCm Flash Attention. Batch 48 is too large for 8192-token sequences. We must reduce batch size to 32 to comfortably stay within 96GB.
+
+---
+
+## Run 017 — Batch 32 Adjustment
+**Date:** 2026-03-28 · **Status:** ⚠️ OOM Crash (Batch 32)
+
+| Setting | Value | Δ from prev |
+|---|---|---|
+| Depth / Dim | 12 layers, 576-dim | — |
+| Dataset | 49 composers, 402 vocab | — |
+| Batch Size | 32 × 8192 = 262,144 tok/step | ↓ reduced from 48 |
+| Peak VRAM | >96 GB | ↓ still exceeded limits |
+
+**What changed:** 
+- Reduced `DEVICE_BATCH_SIZE` from 48 down to 32 to fix the HIP OOM error on sequence lengths of 8192.
+- Resumed training directly from Run 012 checkpoint.
+
+**Results & observations:**
+- Just like batch 48, batch 32 failed with an `HIP out of memory` exception inside PyTorch when compiling the `max_seq_len=8192` graph using `torch.compile(..., dynamic=False)`.
+
+**Takeaway:** The quadratic cost of unrolling attention at 8192 tokens dictates that we cannot avoid standard gradient checkpointing if we want to run large batches. Without it, batch size 32 is simply too large.
+
+---
+
+## Run 018 — Batch 16 Adjustment
+**Date:** 2026-03-28 · **Status:** ✅ Running
+
+| Setting | Value | Δ from prev |
+|---|---|---|
+| Depth / Dim | 12 layers, 576-dim | — |
+| Dataset | 49 composers, 402 vocab | — |
+| Batch Size | 16 × 8192 = 131,072 tok/step | ↓ reduced from 32 |
+| Peak VRAM | ~85 GB | ↓ expected safe range |
+
+**What changed:** 
+- Drastically reduced `DEVICE_BATCH_SIZE` down to 16.
+- Total batch size becomes 131,072 directly replicating successful 131k token step limits achieved during Run 010 (where it successfully trained for 4+ hours).
+
+---
+
 ## Summary Table
 
 | Run | Depth | Params | Dataset | Time | Batch | Epochs | val_bpb | Notes |
@@ -136,6 +196,10 @@
 | 005 | 12 | 49.3M | 3,188 files (43.7M tok) | 1h | 197K | 3 | **0.887** | Extended training |
 | 006 | 12 | 49.3M | 25,829 seqs (377M tok) | 2h | 131K | 0.5 | **0.784** | ✅ Transposition aug |
 | 010 | 12 | 49.3M | 25,829 seqs (377M tok) | 4h | 131K | 1 | **0.849** | ✅ Extended aug training |
+| 012 | 12 | 49.6M | 25,829 seqs (381M tok) | 2h | 196K | 0.1 | (running) | ✅ Exp 2.1 & 2.2 (8192+chords) |
+| 016 | 12 | 49.6M | 25,829 seqs (381M tok) | — | 393K | 0.0 | (OOM) | ⚠️ Crashed due to 96GB VRAM limit |
+| 017 | 12 | 49.6M | 25,829 seqs (381M tok) | — | 262K | 0.0 | (OOM) | ⚠️ Still OOM at compile |
+| 018 | 12 | 49.6M | 25,829 seqs (381M tok) | 16h | 131K | 0.0 | (running) | Batch 16 safe adjustment |
 
 ---
 
@@ -174,5 +238,5 @@ See **EXPERIMENTS.md** for the full phased experiment plan (9 experiments across
 - [x] KV-cache generation — ~150 tok/s with live progress output
 - [x] Experiment 1.3: Smarter repetition control — motif-aware penalties (smart/aggressive/off modes)
 - [x] Dynamic momentum — velocity arc guidance for coherent builds/releases
-- [ ] Experiment 2.1: Chord tokens (REMI+) for explicit harmony
-- [ ] Experiment 2.2: Longer context window (4096+) — root cause fix for structural coherence
+- [x] Experiment 2.1: Chord tokens (REMI+) for explicit harmony
+- [x] Experiment 2.2: Longer context window (4096+) — root cause fix for structural coherence

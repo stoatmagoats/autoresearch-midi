@@ -18,8 +18,10 @@
 | 3 | 3.1 | Rule-Based Reward Scoring | new: score.py | 🟡 Medium | High |
 | 3 | 3.2 | DPO Fine-Tuning | new: dpo_train.py | 🔴 High | Very High |
 | 3 | 3.3 | Harmony-Constrained Decoding | generate.py | 🟢 Low | Medium |
+| 4 | 4.1 | Custom Sliding-Window Attention | train.py (Triton) | 🔴 High | High |
+| 4 | 4.2 | TurboQuant KV Cache Quantization | generate.py | 🟡 Medium | High |
 
-**Critical path:** 1.1 → 1.2 → 1.3 → 2.1 → 2.2 → evaluate → decide on Phase 3
+**Critical path:** 1.1 → 1.2 → 1.3 → 2.1 → 2.2 → evaluate → decide on Phase 3 & 4
 
 ---
 
@@ -774,6 +776,93 @@
 - Quick to implement, immediate results
 - But doesn't teach the model anything — the model is still "wrong", we're just masking it
 - Best as a bridge measure while training-side improvements (2.1, 2.2) take effect
+
+---
+
+## Phase 4: Performance & Scaling
+
+### Experiment 4.1 — Custom Sliding-Window Attention Kernel
+
+**Status:** ⬜ Not started
+**Hypothesis:** PyTorch's SDPA on ROCm currently ignores `window_size` and degrades to O(N²) full causal attention. Writing a custom Triton kernel for block-sparse or sliding-window attention will restore O(N * window_size) complexity, slashing VRAM usage and enabling 32k+ sequence lengths.
+**Confidence:** High — conceptually certain, but implementation requires Triton expertise.
+
+#### Why this should work
+- The model configuration already specifies an `SSSL` (Short-Short-Short-Long) window pattern for attention layers.
+- Currently, at 8192 context length, `F.scaled_dot_product_attention` calculates the full 8192×8192 causal attention matrix, taking ~85 GB VRAM for batch 16.
+- A sliding window of 2048 (Short) means each token only attends to the last 2048 tokens. The compute and memory would scale linearly: O(N * W) instead of O(N²).
+
+#### Implementation plan
+
+1. **Write a custom Triton kernel for Sliding Window Attention:**
+   ```python
+   # In train.py or a new file like attention.py
+   import triton
+   import triton.language as tl
+   
+   # Write a forward/backward pass Triton kernel that strictly masks out
+   # elements where (col_idx < row_idx - window_size) without calculating them.
+   ```
+
+2. **Integrate it into the `CausalSelfAttention` module:**
+   ```python
+   # In CausalSelfAttention.forward
+   if IS_ROCM and window_size > 0:
+       # Use our custom triton kernel
+       y = triton_sliding_window_attention(q, k, v, window_size)
+   else:
+       # Fallback to standard SDPA
+   ```
+
+3. **Validate correctness:**
+   - Compare outputs and gradients of the Triton kernel with standard SDPA (with an explicit attention mask) to ensure numerical parity.
+
+4. **Scale Context to 32k+:**
+   - With O(N) memory scaling, attempt training with `MAX_SEQ_LEN = 32768`.
+
+#### What to measure
+- Peak VRAM during training (target: massive reduction for `Short` layers).
+- Throughput (tokens/second) — should be much higher.
+- Maximum possible sequence length before OOM.
+
+#### Trade-offs
+- Triton kernels require custom backward passes for training.
+- ROCm Triton support has quirks (though AOTriton is working, custom kernels might require performance tuning for RDNA3.5).
+
+---
+
+### Experiment 4.2 — TurboQuant KV Cache Quantization
+
+**Status:** ⬜ Not started
+**Hypothesis:** By implementing TurboQuant KV cache quantization (based on Google's recent paper 2504.19874), we can compress the KV cache by up to 6× without statistical loss of accuracy. This directly enables significantly larger max context sizes during generation and dramatically lowers inference VRAM footprints.
+**Confidence:** Medium-High — Supported by formal provable bounds from the paper, but dependent on implementation specifics for optimal hardware acceleration.
+
+#### Why this should work
+- The autoregressive MIDI transformer's KV-cache size currently grows linearly during long generations, bounding generation lengths or concurrent batch sizes. 
+- Using standard unquantized KV-cache (BF16), every sequence step takes up `2 * n_layer * n_kv_head * head_dim` bfloat16 parameters. 
+- Using the TurboQuant methods, we can preserve generation fidelity while reducing the KV footprint by ~6×.
+
+#### Implementation plan
+
+1. **KV Cache Storage Adjustments:**
+   - Modify the pre-allocated Key-Value cache in `generate.py` to store quantized types instead of pure `bfloat16`.
+
+2. **Quantizer and Dequantizer Helper Methods:**
+   - Implement the TurboQuant algorithms to effectively map incoming $K$ and $V$ tensors to low-precision bounded states.
+   - De-quantize on-the-fly during decoding attention calculations.
+
+3. **Experiment with Output Quality:**
+   - Execute side-by-side completions of the unmodified model vs the logic utilizing TurboQuant.
+   - Run validation evaluations using quantized cached representations to confirm the "no statistical loss of accuracy" claim.
+
+#### What to measure
+- Peak KV cache memory size (target: ~6x reduction).
+- Generation tokens-per-second (`tok/s`) to check if overhead slows down generation.
+- Subjective listening quality vs unquantized baseline.
+
+#### Trade-offs
+- Quantization/dequantization overhead may slightly reduce `tok/s` during generation if the memory bandwidth savings don't outpace the extra compute.
+- Requires custom torch compiling or triton implementation for the dequantization overhead to be minimized.
 
 ---
 

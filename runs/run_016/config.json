@@ -1,0 +1,28 @@
+{
+  "run_id": "run_016",
+  "status": "running",
+  "timestamp": "2026-03-28T17:18:55-0500",
+  "resumed_from": "run_012",
+  "hyperparameters": {
+    "TIME_BUDGET": 57600,
+    "DEPTH": 12,
+    "ASPECT_RATIO": 48,
+    "HEAD_DIM": 64,
+    "DEVICE_BATCH_SIZE": 48,
+    "TOTAL_BATCH_SIZE": 393216,
+    "MATRIX_LR": 0.04,
+    "EMBEDDING_LR": 0.6,
+    "UNEMBEDDING_LR": 0.004,
+    "SCALAR_LR": 0.5,
+    "WEIGHT_DECAY": 0.2,
+    "ADAM_BETAS": [
+      0.8,
+      0.95
+    ],
+    "WARMUP_RATIO": 0.0,
+    "WARMDOWN_RATIO": 0.5,
+    "FINAL_LR_FRAC": 0.0,
+    "MAX_SEQ_LEN": 8192,
+    "WINDOW_PATTERN": "SSSL"
+  }
+}

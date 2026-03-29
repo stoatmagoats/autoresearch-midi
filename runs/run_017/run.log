@@ -1,0 +1,17 @@
+Logging to /home/jonathan/Documents/projects/autoresearch/runs/run_017/run.log
+Initial config written to /home/jonathan/Documents/projects/autoresearch/runs/run_017/config.json
+Detected GPU: Radeon 8060S Graphics -> peak BF16 FLOPS: 1.4e+14
+Vocab size: 402
+Model config: {'sequence_len': 8192, 'vocab_size': 402, 'n_layer': 12, 'n_head': 9, 'n_kv_head': 9, 'n_embd': 576, 'window_pattern': 'SSSL'}
+Parameter counts:
+  wte                     : 231,552
+  value_embeds            : 1,389,312
+  lm_head                 : 231,552
+  transformer_matrices    : 47,777,472
+  scalars                 : 24
+  total                   : 49,629,912
+Estimated FLOPs per token: 7.127274e+08
+Traceback (most recent call last):
+  File "/home/jonathan/Documents/projects/autoresearch/train.py", line 635, in <module>
+    assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
+AssertionError
